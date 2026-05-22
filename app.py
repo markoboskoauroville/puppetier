@@ -7,7 +7,7 @@
 
 import streamlit as st
 import streamlit.components.v1 as components
-import requests, time, json, base64, hmac, hashlib, re
+import requests, time, json, base64, hmac, hashlib
 import math, os, io, zipfile, tempfile, subprocess
 from fractions import Fraction
 
@@ -387,7 +387,7 @@ def kling_motion_transfer(ak, sk, img_b64, vid_b64, dur, model, prompt):
         "image":         img_b64,   # raw base64, no data URI prefix
         "motion_video":  vid_b64,   # raw base64, no data URI prefix
         "duration":      int(dur),
-        "mode":          "professional" if "1080" in model else "standard",
+        "mode":          "pro" if "1080" in model else "std",
         "cfg_scale":     0.5,
         "prompt":        prompt or "smooth motion, high quality, cinematic",
         "negative_prompt": "blur, artifacts, distortion, watermark",
@@ -403,7 +403,7 @@ def kling_animate(ak, sk, img_b64, prompt, neg, dur, model):
         "prompt":          prompt,
         "negative_prompt": neg or "",
         "duration":        int(dur),
-        "mode":            "professional" if "1080" in model else "standard",
+        "mode":            "pro" if "1080" in model else "std",
         "cfg_scale":       0.5,
     })
     tid = d.get("data", {}).get("task_id", "")
@@ -540,6 +540,39 @@ def scene_cuts(vb, thresh=0.35):
                     if tv > 0.25: cuts.append(round(tv, 3))
                 except: pass
         return sorted(set(cuts))
+
+def fit_chunk_for_api(video_bytes: bytes, max_mb: float = 6.0) -> bytes:
+    """
+    Ensure chunk fits within Kling API size limit before base64 encoding.
+    base64 adds ~33% overhead, so 6MB raw -> ~8MB on the wire.
+    Pass 1: lower CRF keeping resolution.
+    Pass 2: scale to 720p.
+    Pass 3: scale to 540p last resort.
+    """
+    limit = int(max_mb * 1024 * 1024)
+    if len(video_bytes) <= limit:
+        return video_bytes
+    with tempfile.TemporaryDirectory() as t:
+        inp = os.path.join(t, "i.mp4")
+        out = os.path.join(t, "o.mp4")
+        with open(inp, "wb") as f: f.write(video_bytes)
+        for crf, scale in [(28, None), (30, "1280:720"), (32, "960:540")]:
+            vf = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+            if scale:
+                vf = (f"scale={scale}:force_original_aspect_ratio=decrease,"
+                      "scale=trunc(iw/2)*2:trunc(ih/2)*2")
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", inp,
+                 "-c:v", "libx264", "-preset", "fast",
+                 "-crf", str(crf), "-vf", vf, "-an", out],
+                capture_output=True)
+            if os.path.exists(out) and os.path.getsize(out) > 0:
+                with open(out, "rb") as f: result = f.read()
+                if len(result) <= limit:
+                    return result
+                with open(inp, "wb") as f: f.write(result)
+        with open(out, "rb") as f: return f.read()
+
 
 def extract_seg(vb, start, end, fps):
     """Frame-accurate extraction. -an always — no audio."""
@@ -729,105 +762,6 @@ def build_zip(chunks):
 # ─────────────────────────────────────────────────────────────────────────────
 #  GOOGLE DRIVE
 # ─────────────────────────────────────────────────────────────────────────────
-def drive_configured():
-    return bool(gs("GOOGLE_SERVICE_ACCOUNT_JSON") and gs("GOOGLE_DRIVE_FOLDER_ID"))
-
-def _drive_svc():
-    try:
-        from google.oauth2 import service_account
-        from googleapiclient.discovery import build
-        info = json.loads(gs("GOOGLE_SERVICE_ACCOUNT_JSON"))
-        creds = service_account.Credentials.from_service_account_info(
-            info, scopes=["https://www.googleapis.com/auth/drive"])
-        return build("drive", "v3", credentials=creds, cache_discovery=False)
-    except Exception as e:
-        alog(f"Drive init: {e}"); return None
-
-def drive_upload(data_bytes, filename, mime_type):
-    try:
-        from googleapiclient.http import MediaIoBaseUpload
-        svc = _drive_svc()
-        if not svc: return None
-        folder = gs("GOOGLE_DRIVE_FOLDER_ID") or "root"
-        meta = {"name": filename, "parents": [folder]}
-        media = MediaIoBaseUpload(io.BytesIO(data_bytes), mimetype=mime_type)
-        f = svc.files().create(body=meta, media_body=media,
-                               fields="id,webViewLink").execute()
-        return f.get("webViewLink", "")
-    except Exception as e:
-        alog(f"Drive upload: {e}"); return None
-
-def drive_list(mime_filter=None):
-    try:
-        svc = _drive_svc()
-        if not svc: return []
-        folder = gs("GOOGLE_DRIVE_FOLDER_ID") or "root"
-        q = f"'{folder}' in parents and trashed=false"
-        if mime_filter: q += f" and mimeType contains '{mime_filter}'"
-        res = svc.files().list(q=q, fields="files(id,name,mimeType)",
-                               orderBy="modifiedTime desc", pageSize=40).execute()
-        return res.get("files", [])
-    except Exception as e:
-        alog(f"Drive list: {e}"); return []
-
-def drive_download_id(file_id):
-    try:
-        svc = _drive_svc()
-        if not svc: return None
-        return svc.files().get_media(fileId=file_id).execute()
-    except Exception as e:
-        alog(f"Drive download: {e}"); return None
-
-def fetch_any_url(url):
-    url = url.strip()
-    m = re.search(r'/d/([a-zA-Z0-9_-]{10,})', url)
-    if m:
-        data = drive_download_id(m.group(1))
-        if data: return data
-        url = f"https://drive.google.com/uc?id={m.group(1)}&export=download&confirm=t"
-    r = requests.get(url, allow_redirects=True, timeout=60,
-                     headers={"User-Agent": "Mozilla/5.0"})
-    r.raise_for_status()
-    return r.content
-
-def url_loader_widget(key):
-    """Single-line URL fetch. Returns bytes or None."""
-    u = st.text_input("Load from URL or Google Drive share link",
-                      placeholder="https://drive.google.com/... or any direct URL",
-                      key=f"url_{key}")
-    if u and st.button("Fetch", key=f"fetch_{key}"):
-        with st.spinner("Fetching…"):
-            try:
-                return fetch_any_url(u)
-            except Exception as e:
-                st.error(f"Fetch failed: {e}")
-    return None
-
-def drive_picker_widget(mime_filter=None, key="drv"):
-    """Drive file picker. Returns bytes or None."""
-    if not drive_configured(): return None
-    files = drive_list(mime_filter)
-    if not files:
-        st.caption("no files in Drive folder")
-        return None
-    names = ["— select from Drive —"] + [f["name"] for f in files]
-    sel = st.selectbox("Drive folder", names, key=f"drv_sel_{key}")
-    if sel != "— select from Drive —":
-        fid = next(f["id"] for f in files if f["name"] == sel)
-        if st.button("Load from Drive", key=f"drv_load_{key}"):
-            with st.spinner(f"Downloading {sel}…"):
-                return drive_download_id(fid)
-    return None
-
-def drive_save_btn(data, filename, mime, key):
-    if not drive_configured(): return
-    if st.button(f"Save to Drive  —  {filename}", key=f"drv_save_{key}"):
-        with st.spinner("Uploading…"):
-            link = drive_upload(data, filename, mime)
-            if link:
-                st.success(f"Saved: {link}")
-            else:
-                st.error("Upload failed (check log)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -878,13 +812,6 @@ with st.sidebar:
                               label_visibility="collapsed",
                               placeholder="cinematic, sharp detail…")
 
-    st.markdown('<div class="sec">GOOGLE DRIVE</div>', unsafe_allow_html=True)
-    if drive_configured():
-        st.markdown('<span class="drv-ok">connected — auto-backup active</span>',
-                    unsafe_allow_html=True)
-    else:
-        st.markdown('<span class="drv-no">not configured</span>', unsafe_allow_html=True)
-        st.caption("Add GOOGLE_SERVICE_ACCOUNT_JSON + GOOGLE_DRIVE_FOLDER_ID to Secrets")
 
     if st.session_state.log:
         st.markdown('<div class="sec">LOG</div>', unsafe_allow_html=True)
@@ -941,21 +868,6 @@ with tab1:
             pr = st.session_state.probe
             st.caption(f"{pr['duration']:.2f}s  ·  {pr['fps']:.3f} fps  ·  {pr['width']}×{pr['height']} px")
 
-    with st.expander("Load guide video from URL or Drive"):
-        loaded = url_loader_widget("gv")
-        if loaded:
-            st.session_state.guide_bytes = loaded
-            st.session_state.guide_fk    = f"url_{len(loaded)}"
-            with tempfile.TemporaryDirectory() as t:
-                p = os.path.join(t, "i.mp4")
-                with open(p, "wb") as f: f.write(loaded)
-                try: st.session_state.probe = probe_video(p)
-                except: pass
-            st.rerun()
-        d = drive_picker_widget("video", key="gv_drv")
-        if d:
-            st.session_state.guide_bytes = d
-            st.rerun()
 
     # ── SUBJECT IMAGE ─────────────────────────────────────────────────────────
     st.markdown('<div class="sec">SUBJECT IMAGE</div>', unsafe_allow_html=True)
@@ -970,15 +882,6 @@ with tab1:
             st.session_state.image_fk    = ik
         st.image(imf, width=400)
 
-    with st.expander("Load subject image from URL or Drive"):
-        loaded = url_loader_widget("si")
-        if loaded:
-            st.session_state.image_bytes = loaded
-            st.rerun()
-        d = drive_picker_widget("image", key="si_drv")
-        if d:
-            st.session_state.image_bytes = d
-            st.rerun()
 
     # ── ONLY SHOWN WHEN GUIDE VIDEO IS UPLOADED ───────────────────────────────
     if st.session_state.guide_bytes and st.session_state.probe:
@@ -1153,7 +1056,7 @@ with tab1:
                 prev_bytes = st.session_state.chunk_previews[ac]
 
                 # Player
-                zoom_map = {"1×": 200, "1.5×": 300, "2×": 420, "3×": 580}
+                zoom_map = {"1×": 130, "1.5×": 180, "2×": 240, "3×": 320}
                 zoom_px  = zoom_map.get(settings.get("zoom", "1×"), 200)
                 components.html(
                     player_html(b64(prev_bytes),
@@ -1257,6 +1160,8 @@ with tab1:
                                 seg = do_crop(seg, cs2["cx"], cs2["cy"], cs2["cw"], cs2["ch"])
                             else:
                                 seg = extract_seg(act_vb, eff_s, eff_e, act_fps)
+                            seg = fit_chunk_for_api(seg)  # resize if > 6 MB
+                            alog(f"Chunk {i+1}: {len(seg)//1024}KB after fit")
                             vid64 = b64(seg)
                             stat.info(f"Submitting chunk {i+1} to {chosen_api}…")
                             if chosen_api == "Kling AI":
@@ -1274,9 +1179,6 @@ with tab1:
                             st.session_state.t1_results.append(url)
                             st.session_state.t1_cost = cost_now
                             alog(f"Chunk {i+1}: done")
-                            if drive_configured():
-                                r2 = requests.get(url, timeout=60); r2.raise_for_status()
-                                drive_upload(r2.content, ch["filename"], "video/mp4")
                         except Exception as e:
                             ch["status"] = "fail"
                             alog(f"Chunk {i+1} FAILED: {e}")
@@ -1291,9 +1193,6 @@ with tab1:
                             zb, mc = build_zip(chunks)
                             st.session_state.t1_zip = zb
                             st.session_state.t1_csv = mc
-                            if drive_configured():
-                                drive_upload(zb, "motion_transfer_output.zip", "application/zip")
-                                alog("ZIP saved to Drive")
                         except Exception as ze:
                             st.warning(f"ZIP failed: {ze}")
                     prog.progress(100, text="Complete")
@@ -1381,11 +1280,6 @@ with tab2:
             st.session_state.t2_img_fk    = ik
         st.image(a_img, width=400)
 
-    with st.expander("Load from URL or Drive"):
-        ld = url_loader_widget("t2")
-        if ld: st.session_state.t2_img_bytes = ld; st.rerun()
-        d = drive_picker_widget("image", key="t2_drv")
-        if d: st.session_state.t2_img_bytes = d; st.rerun()
 
     st.markdown('<div class="sec">SETTINGS</div>', unsafe_allow_html=True)
 
@@ -1435,9 +1329,6 @@ with tab2:
                         stat.info(f"Polling clip {n2+1}  (task {tid[:12]}…)")
                         url = k_poll_vid(_ak, _sk, tid)
                         urls.append(url); cost_now += a_per
-                        if drive_configured():
-                            r2 = requests.get(url, timeout=60); r2.raise_for_status()
-                            drive_upload(r2.content, f"animate_clip_{n2+1}.mp4", "video/mp4")
                         alog(f"Animate clip {n2+1}: done")
                     st.session_state.t2_results = urls
                     st.session_state.t2_cost    = cost_now
@@ -1459,7 +1350,6 @@ with tab2:
             st.download_button(f"Download clip {j+1}", data=r2.content,
                                file_name=f"animate_{j+1}.mp4", mime="video/mp4",
                                key=f"dl_t2_{j}")
-            drive_save_btn(r2.content, f"animate_{j+1}.mp4", "video/mp4", f"t2_{j}")
 
     with st.expander("About this tab — ANIMATE"):
         st.markdown("""
@@ -1519,13 +1409,6 @@ with tab3:
     if i_ref:
         st.image(i_ref, width=200)
 
-    with st.expander("Load reference from URL or Drive"):
-        ld = url_loader_widget("t3_ref")
-        if ld: st.session_state.t3_ref_bytes = ld; st.rerun()
-        d = drive_picker_widget("image", key="t3_ref_drv")
-        if d: st.session_state.t3_ref_bytes = d; st.rerun()
-    if st.session_state.t3_ref_bytes and not i_ref:
-        st.caption("Reference loaded from URL/Drive.")
 
     has_ref = bool(i_ref or st.session_state.t3_ref_bytes)
     i_fidelity = 0.5
@@ -1571,10 +1454,6 @@ with tab3:
                     st.session_state.t3_cost    = i_price
                     prog.progress(100)
                     stat.success(f"Done  ·  {len(urls)} image(s)  ·  {usd(i_price)}")
-                    if drive_configured():
-                        for j, url in enumerate(urls):
-                            r2 = requests.get(url, timeout=60); r2.raise_for_status()
-                            drive_upload(r2.content, f"imagine_{j+1}.jpg", "image/jpeg")
                     alog(f"Imagine: {len(urls)} images")
                 except Exception as e:
                     stat.error(str(e)); alog(str(e))
@@ -1592,7 +1471,6 @@ with tab3:
             st.download_button(f"Download image {j+1}", data=r2.content,
                                file_name=f"imagine_{j+1}.jpg", mime="image/jpeg",
                                key=f"dl_t3_{j}")
-            drive_save_btn(r2.content, f"imagine_{j+1}.jpg", "image/jpeg", f"t3_{j}")
 
     with st.expander("About this tab — IMAGINE"):
         st.markdown("""
@@ -1665,11 +1543,6 @@ with tab4:
             st.session_state.t4_img_fk    = ek
         st.image(e_img, width=400)
 
-    with st.expander("Load source from URL or Drive"):
-        ld = url_loader_widget("t4")
-        if ld: st.session_state.t4_img_bytes = ld; st.rerun()
-        d = drive_picker_widget("image", key="t4_drv")
-        if d: st.session_state.t4_img_bytes = d; st.rerun()
 
     # Second image for Try-On
     if edit_mode == "Virtual Try-On":
@@ -1684,11 +1557,6 @@ with tab4:
                 st.session_state.t4_aux_bytes = e_aux.read()
                 st.session_state.t4_aux_fk    = ak2
             st.image(e_aux, width=400)
-        with st.expander("Load garment from URL or Drive"):
-            ld = url_loader_widget("t4_aux")
-            if ld: st.session_state.t4_aux_bytes = ld; st.rerun()
-            d = drive_picker_widget("image", key="t4_aux_drv")
-            if d: st.session_state.t4_aux_bytes = d; st.rerun()
 
     # Edit-specific settings
     st.markdown('<div class="sec">EDIT SETTINGS</div>', unsafe_allow_html=True)
@@ -1777,10 +1645,6 @@ with tab4:
                     st.session_state.t4_cost    = edit_cost
                     prog.progress(100)
                     stat.success(f"Done  ·  {len(urls)} result(s)  ·  {usd(edit_cost)}")
-                    if drive_configured():
-                        for j, url in enumerate(urls):
-                            r2 = requests.get(url, timeout=60); r2.raise_for_status()
-                            drive_upload(r2.content, f"edit_{j+1}.jpg", "image/jpeg")
                     alog(f"Edit ({edit_mode}): {len(urls)} results")
                 except Exception as e:
                     stat.error(str(e)); alog(str(e))
@@ -1798,7 +1662,6 @@ with tab4:
             st.download_button(f"Download result {j+1}", data=r2.content,
                                file_name=f"edit_{j+1}.jpg", mime="image/jpeg",
                                key=f"dl_t4_{j}")
-            drive_save_btn(r2.content, f"edit_{j+1}.jpg", "image/jpeg", f"t4_{j}")
 
     with st.expander("About this tab — EDIT"):
         st.markdown("""
