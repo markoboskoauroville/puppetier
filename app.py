@@ -1,8 +1,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
-#  MOTION TRANSFER STUDIO  v7
+#  MOTION TRANSFER STUDIO  v8
 #  Single-column layout · Fixed CSS · Works at any font size
 #  Tab 1 PUPPETEER · Tab 2 ANIMATE · Tab 3 IMAGINE · Tab 4 EDIT
 #  Kling AI JWT · RunwayML · Google Drive backup + pull
+#  v8 changes: buttons always visible, high-contrast, disabled when not ready
 # ─────────────────────────────────────────────────────────────────────────────
 
 import streamlit as st
@@ -11,27 +12,20 @@ import requests, time, json, base64, hmac, hashlib, threading, uuid
 import math, os, io, zipfile, tempfile, subprocess
 from fractions import Fraction
 
-# Module-level task registry — persists across Streamlit reruns and is accessible
-# from background threads (unlike st.session_state which is main-thread only).
-_TASK_REG  = {}          # session_id -> list[dict]
+_TASK_REG  = {}
 _REG_LOCK  = threading.Lock()
-TASK_FILE  = "/tmp/mts_tasks.json"   # cross-session persistence
+TASK_FILE  = "/tmp/mts_tasks.json"
 
 st.set_page_config(page_title="Motion Transfer Studio", page_icon=None,
                    layout="wide", initial_sidebar_state="expanded")
 
-# ── CSS ───────────────────────────────────────────────────────────────────────
-# IMPORTANT: Never set font-size on * — it breaks Streamlit's internal
-# component sizing and causes text to render over itself.
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&display=swap');
 
-/* Apply font only to body-level elements, not * */
 body { font-family: 'Space Mono', monospace; }
 .stApp { background: #07070f; color: #9d94b0; }
 
-/* Section headers */
 .sec {
   border-top: 1px solid #16132a;
   margin: 1.4rem 0 0.8rem 0;
@@ -43,7 +37,6 @@ body { font-family: 'Space Mono', monospace; }
   font-family: 'Space Mono', monospace;
 }
 
-/* Stat row */
 .srow { display: flex; gap: 2.5rem; margin: 0.6rem 0 1rem 0; flex-wrap: wrap; }
 .stat .lbl {
   color: #3d3660; font-size: 0.65rem;
@@ -55,7 +48,6 @@ body { font-family: 'Space Mono', monospace; }
   font-family: 'Space Mono', monospace;
 }
 
-/* Monospace tables */
 .mt { width: 100%; border-collapse: collapse; font-family: 'Space Mono', monospace; }
 .mt th {
   color: #4a4468; text-align: left; padding: 0.32rem 0.6rem;
@@ -74,7 +66,6 @@ body { font-family: 'Space Mono', monospace; }
 }
 .mt .err td { color: #f87171; }
 
-/* Chunk grid */
 .chunk-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
@@ -91,11 +82,9 @@ body { font-family: 'Space Mono', monospace; }
 .s-wait { color: #3d3660; } .s-run  { color: #a78bfa; }
 .s-done { color: #34d399; } .s-fail { color: #f87171; } .s-skip { color: #d97706; }
 
-/* Drive */
 .drv-ok { color: #34d399; font-size: 0.72rem; font-family: 'Space Mono', monospace; }
 .drv-no { color: #3d3660; font-size: 0.72rem; font-family: 'Space Mono', monospace; }
 
-/* Override Streamlit widget labels */
 [data-testid="stWidgetLabel"] > div,
 [data-testid="stWidgetLabel"] p {
   font-family: 'Space Mono', monospace !important;
@@ -105,7 +94,6 @@ body { font-family: 'Space Mono', monospace; }
   letter-spacing: 0.08em;
 }
 
-/* Inputs */
 .stTextInput input,
 .stNumberInput input,
 .stTextArea textarea {
@@ -122,7 +110,7 @@ body { font-family: 'Space Mono', monospace; }
   font-family: 'Space Mono', monospace !important;
 }
 
-/* Buttons */
+/* ── BUTTONS: base style ── */
 .stButton > button {
   background: #0e0c1c !important;
   border: 1px solid #1e1a32 !important;
@@ -137,14 +125,39 @@ body { font-family: 'Space Mono', monospace; }
   border-color: #a78bfa !important;
   color: #a78bfa !important;
 }
-.stButton > button[kind="primary"] {
-  background: #160f2a !important;
-  border-color: #5b21b6 !important;
-  color: #c4b5fd !important;
-}
-.stButton > button:disabled { opacity: 0.25 !important; }
 
-/* Download button */
+/* ── PRIMARY BUTTONS: high contrast, always visible ── */
+.stButton > button[kind="primary"] {
+  background: #7c3aed !important;
+  border: 2px solid #a78bfa !important;
+  border-radius: 4px !important;
+  color: #ffffff !important;
+  font-family: 'Space Mono', monospace !important;
+  font-size: 0.85rem !important;
+  font-weight: 700 !important;
+  padding: 0.6rem 1.4rem !important;
+  letter-spacing: 0.07em !important;
+  text-transform: uppercase !important;
+  width: 100% !important;
+  margin-top: 0.5rem !important;
+}
+.stButton > button[kind="primary"]:hover {
+  background: #6d28d9 !important;
+  border-color: #c4b5fd !important;
+  color: #ffffff !important;
+}
+
+/* ── DISABLED primary: muted but still visible ── */
+.stButton > button[kind="primary"]:disabled,
+.stButton > button[kind="primary"][disabled] {
+  background: #1a1530 !important;
+  border: 2px solid #2d2550 !important;
+  color: #4a4068 !important;
+  opacity: 1 !important;
+  cursor: not-allowed !important;
+}
+
+/* ── Download button ── */
 .stDownloadButton > button {
   background: #0e0c1c !important;
   border: 1px solid #1e1a32 !important;
@@ -153,18 +166,15 @@ body { font-family: 'Space Mono', monospace; }
   font-size: 0.76rem !important;
 }
 
-/* Slider */
 .stSlider > div > div > div > div { background: #5b21b6 !important; }
 .stSlider > div > div > div       { background: #1a1730 !important; }
 
-/* Checkbox */
 .stCheckbox > label > div > p {
   font-family: 'Space Mono', monospace !important;
   font-size: 0.76rem !important;
   color: #9d94b0 !important;
 }
 
-/* Sidebar */
 [data-testid="stSidebar"] {
   background: #060510 !important;
   border-right: 1px solid #12102a !important;
@@ -175,10 +185,8 @@ body { font-family: 'Space Mono', monospace; }
   font-family: 'Space Mono', monospace !important;
 }
 
-/* Progress */
 .stProgress > div > div { background: #5b21b6 !important; }
 
-/* Tabs */
 .stTabs [data-baseweb="tab-list"] {
   background: #07070f;
   border-bottom: 1px solid #16132a;
@@ -199,11 +207,9 @@ body { font-family: 'Space Mono', monospace; }
   background: transparent !important;
 }
 
-/* Alerts */
 .stAlert { border-radius: 3px !important; font-family: 'Space Mono', monospace !important; }
 .stAlert p { font-family: 'Space Mono', monospace !important; font-size: 0.76rem !important; }
 
-/* Expander */
 .streamlit-expanderHeader {
   font-family: 'Space Mono', monospace !important;
   font-size: 0.72rem !important;
@@ -212,7 +218,6 @@ body { font-family: 'Space Mono', monospace; }
   letter-spacing: 0.1em;
 }
 
-/* File uploader */
 [data-testid="stFileUploader"] section {
   background: #0a0918 !important;
   border: 1px solid #1a1730 !important;
@@ -224,25 +229,34 @@ body { font-family: 'Space Mono', monospace; }
   color: #4a4468 !important;
 }
 
-/* Hide Streamlit branding */
 #MainMenu, footer, header { visibility: hidden; }
 
-/* Caption text */
 .stCaption p {
   font-family: 'Space Mono', monospace !important;
   color: #4a4468 !important;
   font-size: 0.7rem !important;
 }
 
-/* Radio */
 .stRadio > div { gap: 0.5rem; }
 .stRadio label span p {
   font-family: 'Space Mono', monospace !important;
   font-size: 0.76rem !important;
 }
 
-/* Metric — hide native, use custom */
 div[data-testid="metric-container"] { display: none !important; }
+
+/* ── hint box shown when button is disabled ── */
+.hint-box {
+  background: #0d0b1e;
+  border: 1px solid #1e1a32;
+  border-radius: 4px;
+  padding: 0.5rem 0.8rem;
+  margin-bottom: 0.4rem;
+  font-family: 'Space Mono', monospace;
+  font-size: 0.7rem;
+  color: #5a5278;
+}
+.hint-box span { color: #f87171; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -332,6 +346,15 @@ def get_cs(i, dur):
             crop_en=False, cx=0, cy=0, cw=0, ch=0)
     return st.session_state.chunk_settings[i]
 
+def hint_box(items):
+    """Render a visible hint box listing what is still needed."""
+    if not items:
+        return
+    lines = "".join(f"<span>✗</span> {i}<br>" for i in items)
+    st.markdown(
+        f'<div class="hint-box"><strong style="color:#a78bfa;">Still needed:</strong><br>{lines}</div>',
+        unsafe_allow_html=True)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  KLING JWT
@@ -393,13 +416,13 @@ def k_poll_img(ak, sk, tid, endpoint="generations", mw=300):
 
 def kling_motion_transfer(ak, sk, img_b64, vid_b64, dur, model, prompt):
     d = k_post(ak, sk, "/v1/videos/image2video", {
-        "model_name": "kling-v1-5",
-        "image":         img_b64,   # raw base64, no data URI prefix
-        "motion_video":  vid_b64,   # raw base64, no data URI prefix
-        "duration":      int(dur),
-        "mode":          "pro" if "1080" in model else "std",
-        "cfg_scale":     0.5,
-        "prompt":        prompt or "smooth motion, high quality, cinematic",
+        "model_name":      "kling-v1-5",
+        "image":           img_b64,
+        "motion_video":    vid_b64,
+        "duration":        int(dur),
+        "mode":            "pro" if "1080" in model else "std",
+        "cfg_scale":       0.5,
+        "prompt":          prompt or "smooth motion, high quality, cinematic",
         "negative_prompt": "blur, artifacts, distortion, watermark",
     })
     tid = d.get("data", {}).get("task_id", "")
@@ -552,13 +575,6 @@ def scene_cuts(vb, thresh=0.35):
         return sorted(set(cuts))
 
 def fit_chunk_for_api(video_bytes: bytes, max_mb: float = 6.0) -> bytes:
-    """
-    Ensure chunk fits within Kling API size limit before base64 encoding.
-    base64 adds ~33% overhead, so 6MB raw -> ~8MB on the wire.
-    Pass 1: lower CRF keeping resolution.
-    Pass 2: scale to 720p.
-    Pass 3: scale to 540p last resort.
-    """
     limit = int(max_mb * 1024 * 1024)
     if len(video_bytes) <= limit:
         return video_bytes
@@ -583,9 +599,7 @@ def fit_chunk_for_api(video_bytes: bytes, max_mb: float = 6.0) -> bytes:
                 with open(inp, "wb") as f: f.write(result)
         with open(out, "rb") as f: return f.read()
 
-
 def extract_seg(vb, start, end, fps):
-    """Frame-accurate extraction. -an always — no audio."""
     sf = int(round(start * fps)); ef = int(round(end * fps)); nf = ef - sf
     sts = sf / fps; dur = nf / fps
     with tempfile.TemporaryDirectory() as t:
@@ -748,6 +762,27 @@ def cost_tbl_html(n, api, model, dur_key):
 # ─────────────────────────────────────────────────────────────────────────────
 #  ZIP
 # ─────────────────────────────────────────────────────────────────────────────
+def build_zip(chunks):
+    buf = io.BytesIO()
+    done = [c for c in chunks if c["status"] == "done" and c["output_url"]]
+    lines = ["chunk,filename,start_tc,end_tc,start_s,end_s,dur_s,frames,url"]
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+        for ch in done:
+            r = requests.get(ch["output_url"], timeout=120)
+            r.raise_for_status()
+            zf.writestr(ch["filename"], r.content)
+            lines.append(f"{ch['index']+1},{ch['filename']},"
+                         f"{sec_tc(ch['start'])},{sec_tc(ch['end'])},"
+                         f"{ch['start']:.4f},{ch['end']:.4f},"
+                         f"{ch['duration']:.4f},{ch['n_frames']},{ch['output_url']}")
+        csv = "\n".join(lines)
+        zf.writestr("MANIFEST.csv", csv)
+        zf.writestr("README.txt",
+                    "Import MP4s into Avid/Premiere/DaVinci in chunk order.\n"
+                    "H.264, no audio, every frame I-frame. See MANIFEST.csv.\n")
+    return buf.getvalue(), csv
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  GOOGLE DRIVE
 # ─────────────────────────────────────────────────────────────────────────────
@@ -812,7 +847,7 @@ def load_task_file() -> list | None:
     try:
         with open(TASK_FILE) as f:
             d = json.load(f)
-        if time.time() - d.get("saved_at", 0) < 14400:   # 4-hour window
+        if time.time() - d.get("saved_at", 0) < 14400:
             return d["tasks"]
     except: pass
     return None
@@ -821,7 +856,7 @@ def load_task_file() -> list | None:
 # ─────────────────────────────────────────────────────────────────────────────
 #  ETA + METRICS
 # ─────────────────────────────────────────────────────────────────────────────
-KLING_EST_SEC = 200   # conservative single-clip estimate (seconds)
+KLING_EST_SEC = 200
 
 def fmt_dur(sec: float) -> str:
     sec = max(0, int(sec))
@@ -835,28 +870,19 @@ def calc_eta(tasks: list) -> dict:
     polling  = [t for t in tasks if t.get("status") == "polling"]
     skipped  = [t for t in tasks if t.get("status") == "skip"]
     uploaded = [t for t in done   if t.get("drive_link")]
-
-    # Average actual time per completed clip
     timed = [t for t in done
              if t.get("completed_at") and t.get("submitted_at")]
     if timed:
         avg_sec = sum(t["completed_at"] - t["submitted_at"] for t in timed) / len(timed)
     else:
         avg_sec = KLING_EST_SEC
-
-    # ETA: Kling processes tasks with some concurrency — we assume ~3 parallel slots
     concurrency  = 3
     eta_sec      = max(0, (len(polling) / max(concurrency, 1)) * avg_sec)
-
-    # Start time from earliest submission
     submit_times = [t.get("submitted_at", time.time()) for t in tasks if t.get("submitted_at")]
     start_time   = min(submit_times) if submit_times else time.time()
     elapsed_sec  = time.time() - start_time
-
-    # Absolute finish time
     finish_ts    = time.time() + eta_sec
     finish_str   = time.strftime("%H:%M", time.localtime(finish_ts))
-
     return {
         "total":    total,
         "done":     len(done),
@@ -913,22 +939,15 @@ def metrics_html(m: dict) -> str:
 #  BACKGROUND POLLING WORKER
 # ─────────────────────────────────────────────────────────────────────────────
 def _bg_poll_worker(session_id: str, ak: str, sk: str):
-    """
-    Daemon thread: polls every 10 seconds until all tasks are settled.
-    Writes completed video to Google Drive immediately when available.
-    Updates _TASK_REG[session_id] and saves to TASK_FILE for reconnect.
-    """
     while True:
         with _REG_LOCK:
             tasks = _TASK_REG.get(session_id, [])
-
         pending = [t for t in tasks if t.get("status") == "polling"]
         if not pending:
             with _REG_LOCK:
                 _TASK_REG[session_id + "_done"] = True
             save_task_file(tasks)
             break
-
         for task in pending:
             try:
                 r = requests.get(
@@ -937,19 +956,15 @@ def _bg_poll_worker(session_id: str, ak: str, sk: str):
                 r.raise_for_status()
                 d = r.json().get("data", {})
                 s = d.get("task_status", "processing")
-
                 if s == "succeed":
                     try:
                         url = d["task_result"]["videos"][0]["url"]
                     except (KeyError, IndexError):
                         task["status"] = "failed"; task["error"] = "no URL in response"
                         continue
-
                     task["url"]          = url
                     task["status"]       = "done"
                     task["completed_at"] = time.time()
-
-                    # Immediately upload to Drive if configured
                     if drive_configured():
                         try:
                             vid_data = requests.get(url, timeout=120).content
@@ -958,14 +973,11 @@ def _bg_poll_worker(session_id: str, ak: str, sk: str):
                             task["drive_status"] = "uploaded"
                         except Exception as de:
                             task["drive_status"] = f"upload failed: {de}"
-
                 elif s in ("failed", "error"):
                     task["status"] = "failed"
                     task["error"]  = d.get("task_status_msg", "Kling reported failure")
-
             except Exception:
-                pass   # Don't kill the thread on transient network errors
-
+                pass
         save_task_file(tasks)
         time.sleep(10)
 
@@ -974,36 +986,10 @@ def start_background_polling(session_id: str, ak: str, sk: str):
     t = threading.Thread(
         target=_bg_poll_worker,
         args=(session_id, ak, sk),
-        daemon=True,       # thread dies if main process exits
+        daemon=True,
         name=f"kling_poll_{session_id[:8]}")
     t.start()
     return t
-
-
-def build_zip(chunks):
-    buf = io.BytesIO()
-    done = [c for c in chunks if c["status"] == "done" and c["output_url"]]
-    lines = ["chunk,filename,start_tc,end_tc,start_s,end_s,dur_s,frames,url"]
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
-        for ch in done:
-            r = requests.get(ch["output_url"], timeout=120)
-            r.raise_for_status()
-            zf.writestr(ch["filename"], r.content)
-            lines.append(f"{ch['index']+1},{ch['filename']},"
-                         f"{sec_tc(ch['start'])},{sec_tc(ch['end'])},"
-                         f"{ch['start']:.4f},{ch['end']:.4f},"
-                         f"{ch['duration']:.4f},{ch['n_frames']},{ch['output_url']}")
-        csv = "\n".join(lines)
-        zf.writestr("MANIFEST.csv", csv)
-        zf.writestr("README.txt",
-                    "Import MP4s into Avid/Premiere/DaVinci in chunk order.\n"
-                    "H.264, no audio, every frame I-frame. See MANIFEST.csv.\n")
-    return buf.getvalue(), csv
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  GOOGLE DRIVE
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1054,7 +1040,6 @@ with st.sidebar:
                               label_visibility="collapsed",
                               placeholder="cinematic, sharp detail…")
 
-
     st.markdown('<div class="sec">GOOGLE DRIVE</div>', unsafe_allow_html=True)
     if drive_configured():
         st.markdown('<span style="color:#34d399;font-size:.72rem;">connected — Drive backup active</span>',
@@ -1062,7 +1047,7 @@ with st.sidebar:
     else:
         st.markdown('<span style="color:#3d3660;font-size:.72rem;">not configured</span>',
                     unsafe_allow_html=True)
-        st.caption("Add secrets to enable auto-backup (see setup guide in Puppeteer tab)")
+        st.caption("Add secrets to enable auto-backup")
 
     if st.session_state.log:
         st.markdown('<div class="sec">LOG</div>', unsafe_allow_html=True)
@@ -1080,9 +1065,6 @@ if not ffok():
     st.error("ffmpeg not found — add  ffmpeg  to packages.txt and redeploy")
     st.stop()
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  TABS
-# ─────────────────────────────────────────────────────────────────────────────
 tab1, tab2, tab3, tab4 = st.tabs(["PUPPETEER", "ANIMATE", "IMAGINE", "EDIT"])
 
 
@@ -1091,38 +1073,30 @@ tab1, tab2, tab3, tab4 = st.tabs(["PUPPETEER", "ANIMATE", "IMAGINE", "EDIT"])
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab1:
 
-    # ── TASK MONITOR  (shown when background tasks are active or resumable) ──
     session_id = st.session_state.session_id
 
-    # Auto-load saved task state for reconnect
     if not st.session_state.bg_tasks and not st.session_state.bg_resumed:
         saved = load_task_file()
         if saved and any(t.get("status") == "polling" for t in saved):
             st.session_state.bg_tasks    = saved
             st.session_state.bg_active   = True
             st.session_state.bg_resumed  = True
-            # Re-register tasks in global registry
             with _REG_LOCK:
                 _TASK_REG[session_id] = saved
-            # Restart polling thread for remaining tasks
             if st.session_state.get("ak_saved") and st.session_state.get("sk_saved"):
                 start_background_polling(
                     session_id,
                     st.session_state.ak_saved,
                     st.session_state.sk_saved)
 
-    # Show monitor whenever we have background tasks
     bg_tasks = _TASK_REG.get(session_id, st.session_state.bg_tasks)
     if bg_tasks:
         m = calc_eta(bg_tasks)
         st.markdown(metrics_html(m), unsafe_allow_html=True)
-
-        # Auto-refresh every 12 seconds while tasks are in flight
         if m["polling"] > 0:
             st.caption(
                 f"Auto-refreshing every 12 seconds.  "
-                f"You can close this tab — Kling continues processing on their servers, "
-                f"and your Drive folder will receive completed clips automatically.")
+                f"You can close this tab — Kling continues processing on their servers.")
             time.sleep(12)
             st.rerun()
         else:
@@ -1133,7 +1107,6 @@ with tab1:
                     + (f"{m['uploaded']} clips uploaded to Drive." if m["uploaded"] > 0 else ""))
                 st.session_state.bg_active = False
 
-        # Task detail table
         rows = ""
         for t in bg_tasks:
             if t.get("status") == "skip": continue
@@ -1156,7 +1129,6 @@ with tab1:
             f'</tr></thead><tbody>{rows}</tbody></table>',
             unsafe_allow_html=True)
 
-        # ZIP download from completed tasks
         done_tasks = [t for t in bg_tasks if t.get("status") == "done" and t.get("url")]
         if done_tasks:
             if st.button(f"Build ZIP from {len(done_tasks)} completed clips", key="bg_zip"):
@@ -1178,7 +1150,6 @@ with tab1:
                                    mime="application/zip", type="primary")
 
         st.markdown('<div class="sec">NEW JOB</div>', unsafe_allow_html=True)
-
 
     # ── GUIDE VIDEO ──────────────────────────────────────────────────────────
     st.markdown('<div class="sec">GUIDE VIDEO</div>', unsafe_allow_html=True)
@@ -1208,7 +1179,6 @@ with tab1:
             pr = st.session_state.probe
             st.caption(f"{pr['duration']:.2f}s  ·  {pr['fps']:.3f} fps  ·  {pr['width']}×{pr['height']} px")
 
-
     # ── SUBJECT IMAGE ─────────────────────────────────────────────────────────
     st.markdown('<div class="sec">SUBJECT IMAGE</div>', unsafe_allow_html=True)
 
@@ -1222,8 +1192,6 @@ with tab1:
             st.session_state.image_fk    = ik
         st.image(imf, width=400)
 
-
-    # ── ONLY SHOWN WHEN GUIDE VIDEO IS UPLOADED ───────────────────────────────
     if st.session_state.guide_bytes and st.session_state.probe:
         pr      = st.session_state.probe
         vdur    = pr["duration"]; vfps = pr["fps"]; vw = pr["width"]; vh = pr["height"]
@@ -1236,27 +1204,17 @@ with tab1:
                     unsafe_allow_html=True)
         with st.expander("Configure crop" + (" (ACTIVE)" if st.session_state.crop_en else "")):
             st.caption(f"Source resolution: {vw} × {vh} px. All values in pixels, must be even.")
-
-            cx = st.number_input("Left edge  (x)", 0, max(vw - 2, 0),
-                                 st.session_state.crop_x, step=2)
-            cy = st.number_input("Top edge   (y)", 0, max(vh - 2, 0),
-                                 st.session_state.crop_y, step=2)
-            cw = st.number_input("Width", 2, vw,
-                                 vw if not st.session_state.crop_en else st.session_state.crop_w,
-                                 step=2)
-            ch = st.number_input("Height", 2, vh,
-                                 vh if not st.session_state.crop_en else st.session_state.crop_h,
-                                 step=2)
-
+            cx = st.number_input("Left edge  (x)", 0, max(vw - 2, 0), st.session_state.crop_x, step=2)
+            cy = st.number_input("Top edge   (y)", 0, max(vh - 2, 0), st.session_state.crop_y, step=2)
+            cw = st.number_input("Width", 2, vw, vw if not st.session_state.crop_en else st.session_state.crop_w, step=2)
+            ch = st.number_input("Height", 2, vh, vh if not st.session_state.crop_en else st.session_state.crop_h, step=2)
             noop = (cx == 0 and cy == 0 and cw == vw and ch == vh)
             if not noop:
                 st.caption(f"Will crop to {cw} × {ch} px starting at ({cx}, {cy})")
-
             if st.button("Apply Crop", disabled=noop):
                 with st.spinner("Cropping…"):
                     try:
-                        cr = do_crop(st.session_state.guide_bytes,
-                                     int(cx), int(cy), int(cw), int(ch))
+                        cr = do_crop(st.session_state.guide_bytes, int(cx), int(cy), int(cw), int(ch))
                         with tempfile.TemporaryDirectory() as t:
                             p = os.path.join(t, "c.mp4")
                             with open(p, "wb") as f: f.write(cr)
@@ -1272,7 +1230,6 @@ with tab1:
                         st.rerun()
                     except Exception as e:
                         st.error(f"Crop failed: {e}")
-
             if st.session_state.crop_en:
                 np2 = st.session_state.working_probe
                 st.caption(f"Active crop: {np2['width']} × {np2['height']} px  ·  {np2['duration']:.2f}s")
@@ -1284,12 +1241,8 @@ with tab1:
                     st.rerun()
 
         # ── CUT POINTS ────────────────────────────────────────────────────────
-        st.markdown('<div class="sec">CUT POINTS  —  shot boundaries</div>',
-                    unsafe_allow_html=True)
-
-        thr = st.slider(
-            "Scene detection sensitivity  (lower = more cuts detected)",
-            0.10, 0.60, 0.35, 0.05)
+        st.markdown('<div class="sec">CUT POINTS  —  shot boundaries</div>', unsafe_allow_html=True)
+        thr = st.slider("Scene detection sensitivity  (lower = more cuts detected)", 0.10, 0.60, 0.35, 0.05)
         if st.button("Auto-detect scene cuts"):
             with st.spinner("Running ffmpeg scene detection…"):
                 found = scene_cuts(act_vb, thr)
@@ -1302,11 +1255,8 @@ with tab1:
                     st.info("No cuts found at this threshold. Try lowering it.")
 
         st.caption("Drag the playhead to a shot change, then click Add Cut.")
-        ph = st.slider(
-            "Playhead position (seconds)",
-            0.0, float(act_dur), 0.0,
-            step=round(1.0 / act_fps, 4),
-            format="%.3f")
+        ph = st.slider("Playhead position (seconds)", 0.0, float(act_dur), 0.0,
+                       step=round(1.0 / act_fps, 4), format="%.3f")
         st.caption(f"Position: {sec_tc(ph, act_fps)}  ({ph:.3f}s)")
 
         col_add, col_type = st.columns([1, 2])
@@ -1358,7 +1308,6 @@ with tab1:
             stats_html([("TOTAL", len(chunks)), ("TO PROCESS", n_proc),
                         ("SKIP", n_skip), ("EST. OUTPUT", f"{n_proc * API_MAX_SEC}s")]),
             unsafe_allow_html=True)
-
         st.markdown(chunk_grid_html(chunks, st.session_state.active_chunk, act_fps),
                     unsafe_allow_html=True)
 
@@ -1394,27 +1343,19 @@ with tab1:
             if ac in st.session_state.chunk_previews:
                 settings   = get_cs(ac, ch["duration"])
                 prev_bytes = st.session_state.chunk_previews[ac]
-
-                # Player
                 zoom_map = {"1×": 130, "1.5×": 180, "2×": 240, "3×": 320}
                 zoom_px  = zoom_map.get(settings.get("zoom", "1×"), 200)
                 components.html(
-                    player_html(b64(prev_bytes),
-                                settings["in_pt"], settings["out_pt"],
+                    player_html(b64(prev_bytes), settings["in_pt"], settings["out_pt"],
                                 settings["loop"], zoom_px),
                     height=zoom_px + 60, scrolling=False)
                 st.caption("Click video to play/pause.  Click timeline to seek.")
 
-                # Controls below the player — single column
                 st.markdown("**In / Out points**  (seconds from chunk start)")
-                ni = st.number_input("IN point",  0.0, ch["duration"],
-                                     float(settings["in_pt"]),
-                                     step=round(1.0 / act_fps, 4),
-                                     key=f"in_{ac}", format="%.3f")
-                no = st.number_input("OUT point", 0.0, ch["duration"],
-                                     float(settings["out_pt"]),
-                                     step=round(1.0 / act_fps, 4),
-                                     key=f"out_{ac}", format="%.3f")
+                ni = st.number_input("IN point",  0.0, ch["duration"], float(settings["in_pt"]),
+                                     step=round(1.0 / act_fps, 4), key=f"in_{ac}", format="%.3f")
+                no = st.number_input("OUT point", 0.0, ch["duration"], float(settings["out_pt"]),
+                                     step=round(1.0 / act_fps, 4), key=f"out_{ac}", format="%.3f")
                 if ni > 0.01 or no < ch["duration"] - 0.01:
                     st.caption(f"Effective duration sent to API: {no - ni:.3f}s")
 
@@ -1446,216 +1387,185 @@ with tab1:
 
         # ── COST ─────────────────────────────────────────────────────────────
         st.markdown('<div class="sec">COST ESTIMATE</div>', unsafe_allow_html=True)
-        per = (KLING_VID_PRICE if chosen_api == "Kling AI"
-               else RUNWAY_VID_PRICE)[vid_model][API_MAX_SEC]
-        st.markdown(cost_tbl_html(n_proc, chosen_api, vid_model, API_MAX_SEC),
-                    unsafe_allow_html=True)
+        per = (KLING_VID_PRICE if chosen_api == "Kling AI" else RUNWAY_VID_PRICE)[vid_model][API_MAX_SEC]
+        st.markdown(cost_tbl_html(n_proc, chosen_api, vid_model, API_MAX_SEC), unsafe_allow_html=True)
 
         # ── GENERATE ─────────────────────────────────────────────────────────
         st.markdown('<div class="sec">GENERATE</div>', unsafe_allow_html=True)
 
-        if not keys_ok:
-            st.caption("Enter API credentials in the sidebar.")
-        elif not st.session_state.image_bytes:
-            st.caption("Upload the subject image above.")
-        elif n_proc == 0:
-            st.caption("No processable chunks.")
-        else:
-            est = n_proc * per
-            st.caption(
-                f"**Mode A — Submit & Exit** submits all {n_proc} chunks to Kling in one pass "
-                f"(~{n_proc*2}–{n_proc*4} seconds), then a background thread polls and uploads "
-                f"each result to Drive as it finishes. You can close this browser tab immediately "
-                f"after submission.  |  "
-                f"**Mode B — Wait Here** does the same but streams results live to this page.")
+        est = n_proc * per
 
-            col_a, col_b = st.columns(2)
-            with col_a:
-                go_bg = st.button(
-                    f"Submit & Exit  ·  {n_proc} clips  ·  {chosen_api}  ·  est. {usd(est)}",
-                    type="primary", disabled=st.session_state.processing or not drive_configured(),
-                    key="go_bg",
-                    help="Submits all tasks to Kling, starts background polling, uploads to Drive. "
-                         "Requires Google Drive to be configured in Secrets.")
-                if not drive_configured():
-                    st.caption("Drive not configured — see setup guide at the bottom of this tab.")
-            with col_b:
-                go_wait = st.button(
-                    f"Wait Here  ·  {n_proc} clips  ·  {chosen_api}  ·  est. {usd(est)}",
-                    disabled=st.session_state.processing, key="go_wait",
-                    help="Submits and polls inline. Keep this tab open.")
+        # Collect what is missing
+        missing1 = []
+        if not keys_ok:       missing1.append("API credentials (sidebar)")
+        if not st.session_state.image_bytes: missing1.append("subject image upload")
+        if n_proc == 0:       missing1.append("processable chunks (upload guide video)")
 
-            # ── SHARED EXTRACTION HELPER ──────────────────────────────────────
-            def extract_one_chunk(ch, act_vb, act_fps):
-                cs2    = st.session_state.chunk_settings.get(ch["index"], {})
-                in_pt  = cs2.get("in_pt",  0.0)
-                out_pt = cs2.get("out_pt", ch["duration"])
-                eff_s  = ch["start"] + in_pt
-                eff_e  = ch["start"] + out_pt
-                if cs2.get("crop_en") and cs2.get("cw", 0) > 0:
-                    seg = extract_seg(act_vb, eff_s, eff_e, act_fps)
-                    seg = do_crop(seg, cs2["cx"], cs2["cy"], cs2["cw"], cs2["ch"])
-                else:
-                    seg = extract_seg(act_vb, eff_s, eff_e, act_fps)
-                return fit_chunk_for_api(seg), eff_s, eff_e
+        hint_box(missing1)
 
-            # ── MODE A: SUBMIT & EXIT ─────────────────────────────────────────
-            if go_bg:
-                st.session_state.processing = True
-                prog = st.progress(0, text="Extracting and submitting all chunks…")
-                stat = st.empty()
-                try:
-                    img64    = b64(st.session_state.image_bytes)
-                    sid      = st.session_state.session_id
-                    task_list = []
+        st.caption(
+            f"**Submit & Exit** — submits all {n_proc} chunks, background thread polls "
+            f"and uploads to Drive. You can close the tab immediately.  "
+            f"**Wait Here** — same but streams results live to this page.")
 
-                    for ch in chunks:
-                        i = ch["index"]
-                        if ch["status"] == "skip":
-                            task_list.append({**ch, "task_id": None, "url": None,
-                                              "drive_link": None, "drive_status": "",
-                                              "submitted_at": None, "completed_at": None})
-                            continue
+        col_a, col_b = st.columns(2)
+        with col_a:
+            go_bg = st.button(
+                f"▶  SUBMIT & EXIT  ·  {n_proc} clips  ·  est. {usd(est)}",
+                type="primary",
+                disabled=(bool(missing1) or st.session_state.processing or not drive_configured()),
+                key="go_bg")
+            if not drive_configured() and not missing1:
+                st.caption("Drive not configured — see setup guide below.")
+        with col_b:
+            go_wait = st.button(
+                f"▶  WAIT HERE  ·  {n_proc} clips  ·  est. {usd(est)}",
+                type="primary",
+                disabled=(bool(missing1) or st.session_state.processing),
+                key="go_wait")
 
-                        pct = int((i / len(chunks)) * 90)
-                        prog.progress(pct, text=f"Submitting chunk {i+1}/{len(chunks)}…")
-                        stat.info(f"Extracting + submitting chunk {i+1}…")
+        def extract_one_chunk(ch, act_vb, act_fps):
+            cs2    = st.session_state.chunk_settings.get(ch["index"], {})
+            in_pt  = cs2.get("in_pt",  0.0)
+            out_pt = cs2.get("out_pt", ch["duration"])
+            eff_s  = ch["start"] + in_pt
+            eff_e  = ch["start"] + out_pt
+            if cs2.get("crop_en") and cs2.get("cw", 0) > 0:
+                seg = extract_seg(act_vb, eff_s, eff_e, act_fps)
+                seg = do_crop(seg, cs2["cx"], cs2["cy"], cs2["cw"], cs2["ch"])
+            else:
+                seg = extract_seg(act_vb, eff_s, eff_e, act_fps)
+            return fit_chunk_for_api(seg), eff_s, eff_e
 
-                        try:
-                            seg, eff_s, eff_e = extract_one_chunk(ch, act_vb, act_fps)
-                            vid64 = b64(seg)
-                            alog(f"Chunk {i+1}: {len(seg)//1024}KB")
+        # ── MODE A ────────────────────────────────────────────────────────────
+        if go_bg:
+            st.session_state.processing = True
+            prog = st.progress(0, text="Extracting and submitting all chunks…")
+            stat = st.empty()
+            try:
+                img64     = b64(st.session_state.image_bytes)
+                sid       = st.session_state.session_id
+                task_list = []
+                for ch in chunks:
+                    i = ch["index"]
+                    if ch["status"] == "skip":
+                        task_list.append({**ch, "task_id": None, "url": None,
+                                          "drive_link": None, "drive_status": "",
+                                          "submitted_at": None, "completed_at": None})
+                        continue
+                    pct = int((i / len(chunks)) * 90)
+                    prog.progress(pct, text=f"Submitting chunk {i+1}/{len(chunks)}…")
+                    stat.info(f"Extracting + submitting chunk {i+1}…")
+                    try:
+                        seg, eff_s, eff_e = extract_one_chunk(ch, act_vb, act_fps)
+                        vid64 = b64(seg)
+                        alog(f"Chunk {i+1}: {len(seg)//1024}KB")
+                        if chosen_api == "Kling AI":
+                            tid = kling_motion_transfer(ak, sk, img64, vid64, API_MAX_SEC, vid_model, prompt_txt)
+                        else:
+                            tid = runway_motion(rk, img64, vid64, API_MAX_SEC, vid_model, prompt_txt)
+                        task_list.append({
+                            **ch, "task_id": tid, "status": "polling",
+                            "url": None, "drive_link": None, "drive_status": "",
+                            "submitted_at": time.time(), "completed_at": None,
+                        })
+                        alog(f"Chunk {i+1}: submitted → {tid}")
+                    except Exception as e:
+                        task_list.append({**ch, "task_id": None, "status": "failed",
+                                          "error": str(e), "url": None,
+                                          "drive_link": None, "drive_status": "",
+                                          "submitted_at": time.time(), "completed_at": None})
+                        alog(f"Chunk {i+1}: submit failed — {e}")
+                with _REG_LOCK:
+                    _TASK_REG[sid] = task_list
+                st.session_state.bg_tasks  = task_list
+                st.session_state.bg_active = True
+                st.session_state.ak_saved  = ak
+                st.session_state.sk_saved  = sk
+                save_task_file(task_list)
+                if drive_configured():
+                    manifest = json.dumps(task_list, indent=2).encode()
+                    drive_upload(manifest, "_task_manifest.json", "application/json")
+                start_background_polling(sid, ak, sk)
+                prog.progress(100, text="All tasks submitted.")
+                n_submitted = sum(1 for t in task_list if t.get("task_id"))
+                stat.success(
+                    f"{n_submitted}/{n_proc} tasks submitted.  "
+                    f"Background polling started.  You can now close this tab.  "
+                    f"ETA: ~{fmt_dur(n_submitted * KLING_EST_SEC / 3)}")
+            except Exception as e:
+                stat.error(str(e)); alog(str(e))
+            finally:
+                st.session_state.processing = False
 
-                            if chosen_api == "Kling AI":
-                                tid = kling_motion_transfer(ak, sk, img64, vid64,
-                                                            API_MAX_SEC, vid_model, prompt_txt)
-                            else:
-                                tid = runway_motion(rk, img64, vid64, API_MAX_SEC,
-                                                    vid_model, prompt_txt)
-
-                            task_list.append({
-                                **ch,
-                                "task_id":      tid,
-                                "status":       "polling",
-                                "url":          None,
-                                "drive_link":   None,
-                                "drive_status": "",
-                                "submitted_at": time.time(),
-                                "completed_at": None,
-                            })
-                            alog(f"Chunk {i+1}: submitted → {tid}")
-
-                        except Exception as e:
-                            task_list.append({**ch, "task_id": None, "status": "failed",
-                                              "error": str(e), "url": None,
-                                              "drive_link": None, "drive_status": "",
-                                              "submitted_at": time.time(), "completed_at": None})
-                            alog(f"Chunk {i+1}: submit failed — {e}")
-
-                    # Register tasks globally and start background thread
-                    with _REG_LOCK:
-                        _TASK_REG[sid] = task_list
-                    st.session_state.bg_tasks  = task_list
-                    st.session_state.bg_active = True
-                    # Save API keys for reconnect polling
-                    st.session_state.ak_saved  = ak
-                    st.session_state.sk_saved  = sk
-
-                    save_task_file(task_list)
-
-                    # Upload task manifest to Drive so user has IDs even if session dies
-                    if drive_configured():
-                        manifest = json.dumps(task_list, indent=2).encode()
-                        drive_upload(manifest, "_task_manifest.json", "application/json")
-
-                    start_background_polling(sid, ak, sk)
-
-                    prog.progress(100, text="All tasks submitted.")
-                    n_submitted = sum(1 for t in task_list if t.get("task_id"))
-                    stat.success(
-                        f"{n_submitted}/{n_proc} tasks submitted to Kling.  "
-                        f"Background polling started.  "
-                        f"You can now close this tab — results will appear in Drive automatically.  "
-                        f"ETA: ~{fmt_dur(n_submitted * KLING_EST_SEC / 3)} "
-                        f"(assuming ~3 parallel slots)")
-
-                except Exception as e:
-                    stat.error(str(e)); alog(str(e))
-                finally:
-                    st.session_state.processing = False
-
-            # ── MODE B: WAIT HERE ─────────────────────────────────────────────
-            if go_wait:
-                for k2, v2 in dict(t1_chunks=[], t1_results=[], t1_zip=None,
-                                   t1_csv="", t1_cost=0.0, log=[]).items():
-                    st.session_state[k2] = v2
-                st.session_state.processing = True
-                prog = st.progress(0, text="Preparing…")
-                stat = st.empty(); grid = st.empty(); clive = st.empty()
-                try:
-                    img64 = b64(st.session_state.image_bytes)
-                    st.session_state.t1_chunks = chunks
-                    cost_now = 0.0; done_n = 0
-                    for ch in chunks:
-                        i = ch["index"]
-                        if ch["status"] == "skip":
-                            alog(f"Chunk {i+1}: skip"); continue
-                        pct = int(5 + (done_n / max(n_proc, 1)) * 90)
-                        prog.progress(pct, text=f"Chunk {i+1}/{len(chunks)}")
-                        ch["status"] = "run"
-                        grid.markdown(chunk_grid_html(chunks, None, act_fps),
-                                      unsafe_allow_html=True)
-                        try:
-                            stat.info(f"Extracting chunk {i+1}…")
-                            seg, eff_s, eff_e = extract_one_chunk(ch, act_vb, act_fps)
-                            alog(f"Chunk {i+1}: {len(seg)//1024}KB")
-                            vid64 = b64(seg)
-                            stat.info(f"Submitting chunk {i+1} to {chosen_api}…")
-                            if chosen_api == "Kling AI":
-                                tid = kling_motion_transfer(ak, sk, img64, vid64,
-                                                            API_MAX_SEC, vid_model, prompt_txt)
-                                stat.info(f"Polling chunk {i+1}  (task {tid[:12]}…)")
-                                url = k_poll_vid(ak, sk, tid)
-                            else:
-                                tid = runway_motion(rk, img64, vid64, API_MAX_SEC,
-                                                    vid_model, prompt_txt)
-                                stat.info(f"Polling chunk {i+1}  (task {tid[:12]}…)")
-                                url = runway_poll(rk, tid)
-                            ch["output_url"] = url; ch["status"] = "done"
-                            cost_now += per; done_n += 1
-                            st.session_state.t1_results.append(url)
-                            st.session_state.t1_cost = cost_now
-                            alog(f"Chunk {i+1}: done")
-                            if drive_configured():
-                                try:
-                                    vid_data = requests.get(url, timeout=120).content
-                                    drive_upload(vid_data, ch["filename"], "video/mp4")
-                                except: pass
-                        except Exception as e:
-                            ch["status"] = "fail"
-                            alog(f"Chunk {i+1} FAILED: {e}")
-                            st.warning(f"Chunk {i+1} failed: {e}")
-                        grid.markdown(chunk_grid_html(chunks, None, act_fps),
-                                      unsafe_allow_html=True)
-                        clive.caption(f"Cost so far: {usd(cost_now)}  ·  {done_n} done  ·  "
-                                      f"ETA: {fmt_dur((n_proc-done_n)*KLING_EST_SEC/3)}")
-                    done_ch = [c for c in chunks if c["status"] == "done"]
-                    if done_ch:
-                        prog.progress(97, text="Building ZIP…")
-                        try:
-                            zb, mc = build_zip(chunks)
-                            st.session_state.t1_zip = zb
-                            st.session_state.t1_csv = mc
-                            if drive_configured():
-                                drive_upload(zb, "motion_transfer_output.zip", "application/zip")
-                        except Exception as ze:
-                            st.warning(f"ZIP failed: {ze}")
-                    prog.progress(100, text="Complete")
-                    stat.success(f"Done  —  {len(done_ch)}/{n_proc} clips  ·  {usd(cost_now)}")
-                except Exception as e:
-                    stat.error(str(e)); alog(str(e))
-                finally:
-                    st.session_state.processing = False
+        # ── MODE B ────────────────────────────────────────────────────────────
+        if go_wait:
+            for k2, v2 in dict(t1_chunks=[], t1_results=[], t1_zip=None,
+                               t1_csv="", t1_cost=0.0, log=[]).items():
+                st.session_state[k2] = v2
+            st.session_state.processing = True
+            prog = st.progress(0, text="Preparing…")
+            stat = st.empty(); grid = st.empty(); clive = st.empty()
+            try:
+                img64 = b64(st.session_state.image_bytes)
+                st.session_state.t1_chunks = chunks
+                cost_now = 0.0; done_n = 0
+                for ch in chunks:
+                    i = ch["index"]
+                    if ch["status"] == "skip":
+                        alog(f"Chunk {i+1}: skip"); continue
+                    pct = int(5 + (done_n / max(n_proc, 1)) * 90)
+                    prog.progress(pct, text=f"Chunk {i+1}/{len(chunks)}")
+                    ch["status"] = "run"
+                    grid.markdown(chunk_grid_html(chunks, None, act_fps), unsafe_allow_html=True)
+                    try:
+                        stat.info(f"Extracting chunk {i+1}…")
+                        seg, eff_s, eff_e = extract_one_chunk(ch, act_vb, act_fps)
+                        alog(f"Chunk {i+1}: {len(seg)//1024}KB")
+                        vid64 = b64(seg)
+                        stat.info(f"Submitting chunk {i+1} to {chosen_api}…")
+                        if chosen_api == "Kling AI":
+                            tid = kling_motion_transfer(ak, sk, img64, vid64, API_MAX_SEC, vid_model, prompt_txt)
+                            stat.info(f"Polling chunk {i+1}  (task {tid[:12]}…)")
+                            url = k_poll_vid(ak, sk, tid)
+                        else:
+                            tid = runway_motion(rk, img64, vid64, API_MAX_SEC, vid_model, prompt_txt)
+                            stat.info(f"Polling chunk {i+1}  (task {tid[:12]}…)")
+                            url = runway_poll(rk, tid)
+                        ch["output_url"] = url; ch["status"] = "done"
+                        cost_now += per; done_n += 1
+                        st.session_state.t1_results.append(url)
+                        st.session_state.t1_cost = cost_now
+                        alog(f"Chunk {i+1}: done")
+                        if drive_configured():
+                            try:
+                                vid_data = requests.get(url, timeout=120).content
+                                drive_upload(vid_data, ch["filename"], "video/mp4")
+                            except: pass
+                    except Exception as e:
+                        ch["status"] = "fail"
+                        alog(f"Chunk {i+1} FAILED: {e}")
+                        st.warning(f"Chunk {i+1} failed: {e}")
+                    grid.markdown(chunk_grid_html(chunks, None, act_fps), unsafe_allow_html=True)
+                    clive.caption(f"Cost so far: {usd(cost_now)}  ·  {done_n} done  ·  "
+                                  f"ETA: {fmt_dur((n_proc-done_n)*KLING_EST_SEC/3)}")
+                done_ch = [c for c in chunks if c["status"] == "done"]
+                if done_ch:
+                    prog.progress(97, text="Building ZIP…")
+                    try:
+                        zb, mc = build_zip(chunks)
+                        st.session_state.t1_zip = zb
+                        st.session_state.t1_csv = mc
+                        if drive_configured():
+                            drive_upload(zb, "motion_transfer_output.zip", "application/zip")
+                    except Exception as ze:
+                        st.warning(f"ZIP failed: {ze}")
+                prog.progress(100, text="Complete")
+                stat.success(f"Done  —  {len(done_ch)}/{n_proc} clips  ·  {usd(cost_now)}")
+            except Exception as e:
+                stat.error(str(e)); alog(str(e))
+            finally:
+                st.session_state.processing = False
 
     # ── RESULTS ──────────────────────────────────────────────────────────────
     if st.session_state.t1_results:
@@ -1686,97 +1596,21 @@ with tab1:
 
 When you use *Submit & Exit* mode, the app submits all tasks to Kling then polls
 them in the background. As each clip finishes, it is uploaded directly to your
-Google Drive folder. You can close this browser tab, shut down your computer, and
-come back hours later to find everything waiting in Drive.
+Google Drive folder.
 
-**Step-by-step setup (one-time, ~10 minutes)**
+**Step-by-step setup**
 
-**1. Create a Google Cloud project**
-- Go to [console.cloud.google.com](https://console.cloud.google.com)
-- Click *Select a project* → *New Project* → give it any name → *Create*
-
-**2. Enable the Drive API**
-- In your project, go to *APIs & Services* → *Library*
-- Search for **Google Drive API** → click it → *Enable*
-
-**3. Create a Service Account**
-- Go to *APIs & Services* → *Credentials* → *Create Credentials* → *Service Account*
-- Give it any name (e.g. `motion-transfer-bot`) → *Done*
-- Click the service account you just created → *Keys* tab → *Add Key* → *Create new key* → **JSON**
-- A JSON file downloads to your computer — keep it safe, treat it like a password
-
-**4. Share your Drive folder with the service account**
-- In Google Drive, create a new folder (e.g. `Motion Transfer Output`)
-- Right-click the folder → *Share* → paste the service account email address
-  (it looks like `motion-transfer-bot@your-project.iam.gserviceaccount.com` — found inside the JSON file as `"client_email"`)
-- Set permission to **Editor** → *Send*
-
-**5. Get the folder ID**
-- Open the folder in Drive — the URL looks like:
-  `https://drive.google.com/drive/folders/1aBcDeFgHiJkLmNoPqRsTuVwXyZ`
-- The folder ID is the long string at the end: `1aBcDeFgHiJkLmNoPqRsTuVwXyZ`
-
-**6. Add secrets to Streamlit Cloud**
-- In your app dashboard on share.streamlit.io → *Settings* → *Secrets*
-- Add these two lines:
+1. Go to [console.cloud.google.com](https://console.cloud.google.com) and create a project.
+2. Enable the **Google Drive API** under APIs & Services > Library.
+3. Create a Service Account under Credentials, download the JSON key file.
+4. Share a Drive folder with the service account email (set to Editor).
+5. Get the folder ID from the Drive URL.
+6. Add to Streamlit Secrets:
 
 ```toml
-GOOGLE_SERVICE_ACCOUNT_JSON = '{"type":"service_account","project_id":"...","private_key_id":"...","private_key":"-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----\n","client_email":"motion-transfer-bot@...iam.gserviceaccount.com","client_id":"...","auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token"}'
-GOOGLE_DRIVE_FOLDER_ID = "1aBcDeFgHiJkLmNoPqRsTuVwXyZ"
+GOOGLE_SERVICE_ACCOUNT_JSON = '{...paste entire JSON content here...}'
+GOOGLE_DRIVE_FOLDER_ID = "your_folder_id_here"
 ```
-
-Paste the **entire JSON file contents** as a single line in the first secret.
-The sidebar will show *connected* when the credentials are valid.
-
-**What gets saved to Drive?**
-- Each rendered clip as soon as it finishes (e.g. `chunk_0001_TC_...mp4`)
-- A task manifest JSON (`_task_manifest.json`) right after submission — contains all task IDs so you can recover if the session times out
-- The final ZIP with all clips and MANIFEST.csv when you click *Build ZIP*
-
-**Session timeout on Streamlit Community Cloud**
-The background polling thread runs as long as the Streamlit server process lives.
-On the free tier, sessions time out after approximately 15 minutes of browser inactivity.
-For a 30-clip job (~3 min each, 3 parallel), most clips complete in 10 minutes — well within the window.
-For longer jobs, the task manifest in Drive contains all task IDs so you can
-resume monitoring in a new session.
-        """)
-
-    with st.expander("About this tab — PUPPETEER"):
-        st.markdown("""
-**What it does**
-
-Puppeteer transfers the motion from a guide video onto your static subject image.
-Kling AI (or RunwayML Act-One) analyses the pose, trajectory and timing of the
-person in the guide video, then animates your image to perform the same movement,
-including 3D rotation, jumps and fine gesture.
-
-**Chunk system**
-
-Both APIs generate a maximum of 10 seconds per call. A 5-minute guide video
-becomes 30 × 10-second clips processed independently, then packaged as a ZIP
-with timecode filenames for import into Avid, Premiere or DaVinci in sequence.
-
-Cut points mark shot boundaries so no hard cut is blended across two API calls.
-Any shot longer than 10 seconds is automatically subdivided.
-
-**Chunk player**
-
-Click a chunk number to open it. Set IN and OUT to trim the first or last frames.
-Loop plays continuously for close inspection. Zoom enlarges the preview.
-Per-chunk crop lets you isolate a different person for each shot if needed.
-
-**Cost — 5-minute video (30 × 10-second clips)**
-
-| API | Quality | Total |
-|-----|---------|-------|
-| Kling AI | Standard 720p | $2.10 |
-| Kling AI | Professional 1080p | $4.20 |
-| RunwayML | Gen-3 Alpha Turbo | ~$30.00 |
-
-**Google Drive**
-
-When configured, each clip uploads to Drive immediately after generation,
-and the final ZIP is saved there too.
         """)
 
 
@@ -1796,20 +1630,16 @@ with tab2:
             st.session_state.t2_img_fk    = ik
         st.image(a_img, width=400)
 
-
     st.markdown('<div class="sec">SETTINGS</div>', unsafe_allow_html=True)
 
     a_prompt = st.text_area(
         "Animation prompt  —  describe how the figure should move",
         "", height=80,
         placeholder="the figure slowly turns and raises their arm, cinematic lighting")
-    a_neg = st.text_input(
-        "Negative prompt", "blur, artifacts, distortion, watermark")
-    a_dur = st.select_slider(
-        "Clip duration", [5, 10], value=10,
-        format_func=lambda x: f"{x} seconds")
-    a_n = st.select_slider(
-        "Number of clips to generate", [1, 2, 4], value=1)
+    a_neg = st.text_input("Negative prompt", "blur, artifacts, distortion, watermark")
+    a_dur = st.select_slider("Clip duration", [5, 10], value=10,
+                             format_func=lambda x: f"{x} seconds")
+    a_n   = st.select_slider("Number of clips to generate", [1, 2, 4], value=1)
 
     a_per = KLING_VID_PRICE[vid_model].get(a_dur, 0.07)
     st.markdown(
@@ -1820,39 +1650,44 @@ with tab2:
 
     st.markdown('<div class="sec">GENERATE</div>', unsafe_allow_html=True)
 
-    if not keys_ok:
-        st.caption("Enter credentials in the sidebar.")
-    elif not st.session_state.t2_img_bytes:
-        st.caption("Upload an image above.")
-    else:
-        if st.button(
-            f"Animate  {a_n} clip(s)  ·  Kling AI  ·  {vid_model}  ·  est. {usd(a_per * a_n)}",
-            type="primary", disabled=st.session_state.processing, key="go2"):
-            _ak = ak or S_AK; _sk = sk or S_SK
-            if not (_ak and _sk):
-                st.error("Kling AI credentials required for this tab.")
-            else:
-                st.session_state.t2_results = []; st.session_state.t2_cost = 0.0
-                st.session_state.processing = True
-                prog = st.progress(0); stat = st.empty()
-                try:
-                    img64 = b64(st.session_state.t2_img_bytes)
-                    urls = []; cost_now = 0.0
-                    for n2 in range(int(a_n)):
-                        prog.progress(int((n2 / a_n) * 90), text=f"Clip {n2+1}/{a_n}…")
-                        stat.info(f"Submitting clip {n2+1}…")
-                        tid = kling_animate(_ak, _sk, img64, a_prompt, a_neg, a_dur, vid_model)
-                        stat.info(f"Polling clip {n2+1}  (task {tid[:12]}…)")
-                        url = k_poll_vid(_ak, _sk, tid)
-                        urls.append(url); cost_now += a_per
-                        alog(f"Animate clip {n2+1}: done")
-                    st.session_state.t2_results = urls
-                    st.session_state.t2_cost    = cost_now
-                    prog.progress(100); stat.success(f"Done  ·  {usd(cost_now)}")
-                except Exception as e:
-                    stat.error(str(e)); alog(str(e))
-                finally:
-                    st.session_state.processing = False
+    # Collect missing requirements
+    missing2 = []
+    if not keys_ok:                           missing2.append("API credentials (sidebar)")
+    if not st.session_state.t2_img_bytes:    missing2.append("source image upload")
+
+    hint_box(missing2)
+
+    if st.button(
+        f"▶  ANIMATE  {a_n} clip(s)  ·  Kling AI  ·  {vid_model}  ·  est. {usd(a_per * a_n)}",
+        type="primary",
+        disabled=(bool(missing2) or st.session_state.processing),
+        key="go2"):
+
+        _ak = ak or S_AK; _sk = sk or S_SK
+        if not (_ak and _sk):
+            st.error("Kling AI credentials required for this tab.")
+        else:
+            st.session_state.t2_results = []; st.session_state.t2_cost = 0.0
+            st.session_state.processing = True
+            prog = st.progress(0); stat = st.empty()
+            try:
+                img64 = b64(st.session_state.t2_img_bytes)
+                urls = []; cost_now = 0.0
+                for n2 in range(int(a_n)):
+                    prog.progress(int((n2 / a_n) * 90), text=f"Clip {n2+1}/{a_n}…")
+                    stat.info(f"Submitting clip {n2+1}…")
+                    tid = kling_animate(_ak, _sk, img64, a_prompt, a_neg, a_dur, vid_model)
+                    stat.info(f"Polling clip {n2+1}  (task {tid[:12]}…)")
+                    url = k_poll_vid(_ak, _sk, tid)
+                    urls.append(url); cost_now += a_per
+                    alog(f"Animate clip {n2+1}: done")
+                st.session_state.t2_results = urls
+                st.session_state.t2_cost    = cost_now
+                prog.progress(100); stat.success(f"Done  ·  {usd(cost_now)}")
+            except Exception as e:
+                stat.error(str(e)); alog(str(e))
+            finally:
+                st.session_state.processing = False
 
     if st.session_state.t2_results:
         st.markdown('<div class="sec">RESULTS</div>', unsafe_allow_html=True)
@@ -1874,22 +1709,9 @@ with tab2:
 Animate takes a still image and generates a short video using only a text prompt.
 There is no motion reference video — you describe the motion in words.
 
-**When to use it**
-
-- Bring a portrait, illustration or product photo to life with a simple description.
-- Prototype animation ideas before investing in a full Puppeteer job.
-- Social media clips from still photos.
-
 **Prompt tips**
 
-Be specific about movement direction and camera:
-*"the figure slowly raises their right arm, camera stays fixed, soft studio lighting."*
-Add style words: *cinematic, 4K, sharp detail.*
-
-**Limitations**
-
-Output is a single clip of 5 or 10 seconds. For longer or more precisely controlled
-animation, use the Puppeteer tab with a motion reference video.
+Be specific: *"the figure slowly raises their right arm, camera stays fixed, soft studio lighting."*
 
 **Cost**
 
@@ -1911,10 +1733,9 @@ with tab3:
         "", height=100,
         placeholder="full body portrait, female flamenco dancer, red dress, "
                     "dramatic stage lighting, shallow depth of field, cinematic")
-    i_neg = st.text_input(
-        "Negative prompt", "blur, text, watermark, artifacts, low quality")
+    i_neg    = st.text_input("Negative prompt", "blur, text, watermark, artifacts, low quality")
     i_aspect = st.selectbox("Aspect ratio", ASPECT_RATIOS, index=1)
-    i_n = st.select_slider("Number of images", [1, 2, 4], value=1)
+    i_n      = st.select_slider("Number of images", [1, 2, 4], value=1)
 
     st.markdown('<div class="sec">REFERENCE IMAGE  (optional)</div>', unsafe_allow_html=True)
     st.caption("Supply a reference image to guide style or composition.")
@@ -1925,8 +1746,7 @@ with tab3:
     if i_ref:
         st.image(i_ref, width=200)
 
-
-    has_ref = bool(i_ref or st.session_state.t3_ref_bytes)
+    has_ref   = bool(i_ref or st.session_state.t3_ref_bytes)
     i_fidelity = 0.5
     if has_ref:
         i_fidelity = st.slider(
@@ -1941,40 +1761,44 @@ with tab3:
 
     st.markdown('<div class="sec">GENERATE</div>', unsafe_allow_html=True)
 
-    if not keys_ok:
-        st.caption("Enter credentials in the sidebar.")
-    elif not i_prompt.strip():
-        st.caption("Enter a prompt above.")
-    else:
-        if st.button(
-            f"Generate  {i_n} image(s)  ·  {img_model}  ·  est. {usd(i_price)}",
-            type="primary", disabled=st.session_state.processing, key="go3"):
-            _ak = ak or S_AK; _sk = sk or S_SK
-            if not (_ak and _sk):
-                st.error("Kling AI credentials required.")
-            else:
-                st.session_state.t3_results = []; st.session_state.t3_cost = 0.0
-                st.session_state.processing = True
-                stat = st.empty(); prog = st.progress(0)
-                try:
-                    ref_b64 = None
-                    if i_ref: ref_b64 = b64(i_ref.read())
-                    elif st.session_state.t3_ref_bytes:
-                        ref_b64 = b64(st.session_state.t3_ref_bytes)
-                    stat.info("Submitting to Kling image generation…"); prog.progress(20)
-                    tid = kling_imagine(_ak, _sk, i_prompt, i_neg, i_aspect,
-                                       i_n, img_model, ref_b64, i_fidelity)
-                    stat.info(f"Polling task {tid[:12]}…"); prog.progress(40)
-                    urls = k_poll_img(_ak, _sk, tid)
-                    st.session_state.t3_results = urls
-                    st.session_state.t3_cost    = i_price
-                    prog.progress(100)
-                    stat.success(f"Done  ·  {len(urls)} image(s)  ·  {usd(i_price)}")
-                    alog(f"Imagine: {len(urls)} images")
-                except Exception as e:
-                    stat.error(str(e)); alog(str(e))
-                finally:
-                    st.session_state.processing = False
+    missing3 = []
+    if not keys_ok:           missing3.append("API credentials (sidebar)")
+    if not i_prompt.strip():  missing3.append("image prompt text")
+
+    hint_box(missing3)
+
+    if st.button(
+        f"▶  GENERATE  {i_n} image(s)  ·  {img_model}  ·  est. {usd(i_price)}",
+        type="primary",
+        disabled=(bool(missing3) or st.session_state.processing),
+        key="go3"):
+
+        _ak = ak or S_AK; _sk = sk or S_SK
+        if not (_ak and _sk):
+            st.error("Kling AI credentials required.")
+        else:
+            st.session_state.t3_results = []; st.session_state.t3_cost = 0.0
+            st.session_state.processing = True
+            stat = st.empty(); prog = st.progress(0)
+            try:
+                ref_b64 = None
+                if i_ref: ref_b64 = b64(i_ref.read())
+                elif st.session_state.t3_ref_bytes:
+                    ref_b64 = b64(st.session_state.t3_ref_bytes)
+                stat.info("Submitting to Kling image generation…"); prog.progress(20)
+                tid = kling_imagine(_ak, _sk, i_prompt, i_neg, i_aspect,
+                                    i_n, img_model, ref_b64, i_fidelity)
+                stat.info(f"Polling task {tid[:12]}…"); prog.progress(40)
+                urls = k_poll_img(_ak, _sk, tid)
+                st.session_state.t3_results = urls
+                st.session_state.t3_cost    = i_price
+                prog.progress(100)
+                stat.success(f"Done  ·  {len(urls)} image(s)  ·  {usd(i_price)}")
+                alog(f"Imagine: {len(urls)} images")
+            except Exception as e:
+                stat.error(str(e)); alog(str(e))
+            finally:
+                st.session_state.processing = False
 
     if st.session_state.t3_results:
         st.markdown('<div class="sec">RESULTS</div>', unsafe_allow_html=True)
@@ -1992,32 +1816,12 @@ with tab3:
         st.markdown("""
 **What it does**
 
-Imagine generates images from text using Kling AI's Kolors model,
-one of the highest-quality text-to-image systems available.
-
-**When to use it**
-
-- Generate character references, background plates, concept art or storyboards.
-- Create a subject image for the Puppeteer or Animate tabs.
-- Produce social media visuals from a text description.
+Imagine generates images from text using Kling AI's Kolors model.
 
 **Prompt tips**
 
-Be descriptive about subject, lighting, composition and style:
-*"full body portrait, female dancer, red dress, dramatic stage lighting,
-Sony A7 IV, 85mm, f/1.8, cinematic, sharp detail."*
-
-**Reference image**
-
-Upload a reference to guide style or composition. Fidelity 0 = only loosely
-inspired by the reference. Fidelity 1 = very close to it.
-
-**Aspect ratios**
-
-- 16:9 — landscape, video thumbnails
-- 9:16 — vertical, social media stories
-- 1:1  — square
-- 4:3  — standard photo
+Describe subject, lighting, composition and style:
+*"full body portrait, female dancer, red dress, dramatic stage lighting, cinematic, sharp detail."*
 
 **Cost**
 
@@ -2025,8 +1829,6 @@ inspired by the reference. Fidelity 1 = very close to it.
 |-------|---------|----------|
 | kolors | ~$0.008 | ~$0.028 |
 | kling-v1 | ~$0.005 | ~$0.018 |
-
-Prices are estimates. Verify at klingai.com/pricing.
         """)
 
 
@@ -2059,8 +1861,6 @@ with tab4:
             st.session_state.t4_img_fk    = ek
         st.image(e_img, width=400)
 
-
-    # Second image for Try-On
     if edit_mode == "Virtual Try-On":
         st.markdown('<div class="sec">GARMENT IMAGE</div>', unsafe_allow_html=True)
         st.caption("Upload the CLOTHING / GARMENT to try on.")
@@ -2074,49 +1874,37 @@ with tab4:
                 st.session_state.t4_aux_fk    = ak2
             st.image(e_aux, width=400)
 
-    # Edit-specific settings
     st.markdown('<div class="sec">EDIT SETTINGS</div>', unsafe_allow_html=True)
     e_prompt = ""; e_neg = ""; e_fid = 0.5
 
     if edit_mode == "Inpaint / Repaint":
         e_prompt = st.text_area(
-            "Describe what to place in the edited region",
-            "", height=80,
+            "Describe what to place in the edited region", "", height=80,
             placeholder="a golden crown on the head, photorealistic, matching lighting")
         e_neg = st.text_input("Negative prompt", "blur, artifacts")
-        e_fid = st.slider(
-            "Fidelity to original structure  (higher = more faithful)",
-            0.0, 1.0, 0.7, 0.05)
-        st.caption("Describe the change you want. For pixel-precise masking, "
-                   "draw a mask in Photoshop/GIMP and upload the masked image as the source.")
+        e_fid = st.slider("Fidelity to original structure  (higher = more faithful)",
+                          0.0, 1.0, 0.7, 0.05)
 
     elif edit_mode == "Variation":
         e_prompt = st.text_area(
-            "Describe the variation",
-            "", height=80,
+            "Describe the variation", "", height=80,
             placeholder="same composition, oil painting style, warmer tones, impressionist")
         e_neg = st.text_input("Negative prompt", "blur, artifacts")
-        e_fid = st.slider(
-            "How different from original  (lower = more different)",
-            0.0, 1.0, 0.4, 0.05)
+        e_fid = st.slider("How different from original  (lower = more different)",
+                          0.0, 1.0, 0.4, 0.05)
 
     elif edit_mode == "Extend Canvas":
         e_prompt = st.text_area(
-            "Describe what to fill in the extended area",
-            "", height=80,
+            "Describe what to fill in the extended area", "", height=80,
             placeholder="continue the background naturally, match existing lighting and perspective")
         e_neg = st.text_input("Negative prompt", "blur, artifacts")
-        e_fid = st.slider(
-            "Fidelity to original edges",
-            0.0, 1.0, 0.8, 0.05)
-        e_extend = st.selectbox(
-            "Extend direction", ["all sides", "left", "right", "top", "bottom"])
+        e_fid = st.slider("Fidelity to original edges", 0.0, 1.0, 0.8, 0.05)
+        e_extend = st.selectbox("Extend direction", ["all sides", "left", "right", "top", "bottom"])
         if e_prompt:
             e_prompt = f"outpaint {e_extend}: {e_prompt}"
 
     elif edit_mode == "Virtual Try-On":
-        st.caption("No additional settings required. "
-                   "Upload the person photo and garment photo above, then generate.")
+        st.caption("No additional settings required. Upload both photos above, then generate.")
 
     edit_cost = KLING_EDIT_PRICE.get(edit_mode, 0.012)
     st.markdown(stats_html([("MODE", edit_mode), ("EST. COST", usd(edit_cost))]),
@@ -2125,47 +1913,49 @@ with tab4:
     st.markdown('<div class="sec">GENERATE</div>', unsafe_allow_html=True)
 
     needs_aux = (edit_mode == "Virtual Try-On")
-    ready = (bool(st.session_state.t4_img_bytes) and
-             (not needs_aux or bool(st.session_state.t4_aux_bytes)))
 
-    if not keys_ok:
-        st.caption("Enter credentials in the sidebar.")
-    elif not st.session_state.t4_img_bytes:
-        st.caption("Upload the source image above.")
-    elif needs_aux and not st.session_state.t4_aux_bytes:
-        st.caption("Upload the garment image above.")
-    else:
-        if st.button(
-            f"Edit  ·  {edit_mode}  ·  Kling AI  ·  est. {usd(edit_cost)}",
-            type="primary", disabled=st.session_state.processing, key="go4"):
-            _ak = ak or S_AK; _sk = sk or S_SK
-            if not (_ak and _sk):
-                st.error("Kling AI credentials required.")
-            else:
-                st.session_state.t4_results = []; st.session_state.t4_cost = 0.0
-                st.session_state.processing = True
-                stat = st.empty(); prog = st.progress(0)
-                try:
-                    img64 = b64(st.session_state.t4_img_bytes)
-                    stat.info(f"Submitting {edit_mode}…"); prog.progress(20)
-                    if edit_mode == "Virtual Try-On":
-                        cloth64 = b64(st.session_state.t4_aux_bytes)
-                        tid = kling_tryon(_ak, _sk, img64, cloth64)
-                        stat.info(f"Polling try-on task {tid[:12]}…"); prog.progress(40)
-                        urls = k_poll_img(_ak, _sk, tid, endpoint="kolors-virtual-try-on")
-                    else:
-                        tid = kling_edit(_ak, _sk, img64, e_prompt, e_neg, e_fid)
-                        stat.info(f"Polling task {tid[:12]}…"); prog.progress(40)
-                        urls = k_poll_img(_ak, _sk, tid)
-                    st.session_state.t4_results = urls
-                    st.session_state.t4_cost    = edit_cost
-                    prog.progress(100)
-                    stat.success(f"Done  ·  {len(urls)} result(s)  ·  {usd(edit_cost)}")
-                    alog(f"Edit ({edit_mode}): {len(urls)} results")
-                except Exception as e:
-                    stat.error(str(e)); alog(str(e))
-                finally:
-                    st.session_state.processing = False
+    missing4 = []
+    if not keys_ok:                           missing4.append("API credentials (sidebar)")
+    if not st.session_state.t4_img_bytes:    missing4.append("source image upload")
+    if needs_aux and not st.session_state.t4_aux_bytes:
+        missing4.append("garment image upload")
+
+    hint_box(missing4)
+
+    if st.button(
+        f"▶  EDIT  ·  {edit_mode}  ·  Kling AI  ·  est. {usd(edit_cost)}",
+        type="primary",
+        disabled=(bool(missing4) or st.session_state.processing),
+        key="go4"):
+
+        _ak = ak or S_AK; _sk = sk or S_SK
+        if not (_ak and _sk):
+            st.error("Kling AI credentials required.")
+        else:
+            st.session_state.t4_results = []; st.session_state.t4_cost = 0.0
+            st.session_state.processing = True
+            stat = st.empty(); prog = st.progress(0)
+            try:
+                img64 = b64(st.session_state.t4_img_bytes)
+                stat.info(f"Submitting {edit_mode}…"); prog.progress(20)
+                if edit_mode == "Virtual Try-On":
+                    cloth64 = b64(st.session_state.t4_aux_bytes)
+                    tid = kling_tryon(_ak, _sk, img64, cloth64)
+                    stat.info(f"Polling try-on task {tid[:12]}…"); prog.progress(40)
+                    urls = k_poll_img(_ak, _sk, tid, endpoint="kolors-virtual-try-on")
+                else:
+                    tid = kling_edit(_ak, _sk, img64, e_prompt, e_neg, e_fid)
+                    stat.info(f"Polling task {tid[:12]}…"); prog.progress(40)
+                    urls = k_poll_img(_ak, _sk, tid)
+                st.session_state.t4_results = urls
+                st.session_state.t4_cost    = edit_cost
+                prog.progress(100)
+                stat.success(f"Done  ·  {len(urls)} result(s)  ·  {usd(edit_cost)}")
+                alog(f"Edit ({edit_mode}): {len(urls)} results")
+            except Exception as e:
+                stat.error(str(e)); alog(str(e))
+            finally:
+                st.session_state.processing = False
 
     if st.session_state.t4_results:
         st.markdown('<div class="sec">RESULTS</div>', unsafe_allow_html=True)
@@ -2181,40 +1971,13 @@ with tab4:
 
     with st.expander("About this tab — EDIT"):
         st.markdown("""
-**What it does**
+**Inpaint / Repaint** — describe a change and the model rewrites that region.
 
-The Edit tab modifies an existing image using Kling AI's image editing capabilities.
+**Variation** — generate a new version with a stylistic or compositional change.
 
-**Inpaint / Repaint**
+**Virtual Try-On** — supply a person photo and a garment photo. Kling composites the clothing onto the person.
 
-Describe a change and the model rewrites that region while preserving the rest.
-Examples: change the background, replace clothing, add or remove an object.
-Set fidelity high (0.7–0.9) to keep the original structure, lower for more
-creative departure. For pixel-precise masking, draw a mask in Photoshop or GIMP
-and supply the masked image as the source.
-
-**Variation**
-
-Generate a new version with a stylistic or compositional change.
-Useful for exploring alternative colour grades, art styles or lighting.
-
-**Virtual Try-On**
-
-Supply a photo of a person and a photo of a garment.
-Kling's Kolors try-on model composites the clothing onto the person with
-realistic draping and lighting. Both photos should show the subject clearly
-against a simple background.
-
-**Extend Canvas  (outpainting)**
-
-Expand the image beyond its original borders. Choose a direction and describe
-what should fill the new area. The model matches existing lighting and perspective.
-
-**API note**
-
-Inpaint, Variation and Extend Canvas use `/v1/images/generations` with an
-image reference. Virtual Try-On uses `/v1/images/kolors-virtual-try-on`.
-Verify field names at docs.klingai.com.
+**Extend Canvas** — expand the image beyond its original borders in any direction.
 
 **Cost**
 
@@ -2233,5 +1996,5 @@ Verify field names at docs.klingai.com.
 st.markdown(
     '<div style="margin-top:3rem;color:#1a1730;font-size:0.65rem;'
     'font-family:\'Space Mono\',monospace;">'
-    'Motion Transfer Studio v7  ·  docs.klingai.com  ·  docs.dev.runwayml.com'
+    'Motion Transfer Studio v8  ·  docs.klingai.com  ·  docs.dev.runwayml.com'
     '</div>', unsafe_allow_html=True)
