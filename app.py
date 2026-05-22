@@ -7,9 +7,15 @@
 
 import streamlit as st
 import streamlit.components.v1 as components
-import requests, time, json, base64, hmac, hashlib
+import requests, time, json, base64, hmac, hashlib, threading, uuid
 import math, os, io, zipfile, tempfile, subprocess
 from fractions import Fraction
+
+# Module-level task registry — persists across Streamlit reruns and is accessible
+# from background threads (unlike st.session_state which is main-thread only).
+_TASK_REG  = {}          # session_id -> list[dict]
+_REG_LOCK  = threading.Lock()
+TASK_FILE  = "/tmp/mts_tasks.json"   # cross-session persistence
 
 st.set_page_config(page_title="Motion Transfer Studio", page_icon=None,
                    layout="wide", initial_sidebar_state="expanded")
@@ -287,6 +293,10 @@ _D = dict(
     t4_aux_bytes=None, t4_aux_fk="",
     t4_results=[], t4_cost=0.0,
     processing=False, log=[],
+    session_id=str(uuid.uuid4()),
+    bg_tasks=[],
+    bg_active=False,
+    bg_resumed=False,
 )
 for k, v in _D.items():
     if k not in st.session_state:
@@ -738,6 +748,238 @@ def cost_tbl_html(n, api, model, dur_key):
 # ─────────────────────────────────────────────────────────────────────────────
 #  ZIP
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  GOOGLE DRIVE
+# ─────────────────────────────────────────────────────────────────────────────
+def drive_configured():
+    return bool(gs("GOOGLE_SERVICE_ACCOUNT_JSON") and gs("GOOGLE_DRIVE_FOLDER_ID"))
+
+def _drive_svc():
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        info  = json.loads(gs("GOOGLE_SERVICE_ACCOUNT_JSON"))
+        creds = service_account.Credentials.from_service_account_info(
+                    info, scopes=["https://www.googleapis.com/auth/drive"])
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
+    except Exception as e:
+        return None
+
+def drive_upload(data_bytes: bytes, filename: str, mime_type: str) -> str:
+    try:
+        from googleapiclient.http import MediaIoBaseUpload
+        svc    = _drive_svc()
+        if not svc: return ""
+        folder = gs("GOOGLE_DRIVE_FOLDER_ID") or "root"
+        meta   = {"name": filename, "parents": [folder]}
+        media  = MediaIoBaseUpload(io.BytesIO(data_bytes), mimetype=mime_type)
+        f = svc.files().create(body=meta, media_body=media,
+                               fields="id,webViewLink").execute()
+        return f.get("webViewLink", "")
+    except Exception as e:
+        return f"error: {e}"
+
+def drive_list(mime_filter=None):
+    try:
+        svc    = _drive_svc()
+        if not svc: return []
+        folder = gs("GOOGLE_DRIVE_FOLDER_ID") or "root"
+        q      = f"'{folder}' in parents and trashed=false"
+        if mime_filter: q += f" and mimeType contains '{mime_filter}'"
+        res = svc.files().list(q=q, fields="files(id,name,mimeType)",
+                               orderBy="modifiedTime desc", pageSize=40).execute()
+        return res.get("files", [])
+    except: return []
+
+def drive_download_id(file_id: str):
+    try:
+        svc = _drive_svc()
+        if not svc: return None
+        return svc.files().get_media(fileId=file_id).execute()
+    except: return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  TASK STATE PERSISTENCE
+# ─────────────────────────────────────────────────────────────────────────────
+def save_task_file(tasks: list):
+    try:
+        with open(TASK_FILE, "w") as f:
+            json.dump({"saved_at": time.time(), "tasks": tasks}, f)
+    except: pass
+
+def load_task_file() -> list | None:
+    try:
+        with open(TASK_FILE) as f:
+            d = json.load(f)
+        if time.time() - d.get("saved_at", 0) < 14400:   # 4-hour window
+            return d["tasks"]
+    except: pass
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ETA + METRICS
+# ─────────────────────────────────────────────────────────────────────────────
+KLING_EST_SEC = 200   # conservative single-clip estimate (seconds)
+
+def fmt_dur(sec: float) -> str:
+    sec = max(0, int(sec))
+    h, r = divmod(sec, 3600); m, s = divmod(r, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+def calc_eta(tasks: list) -> dict:
+    total    = len(tasks)
+    done     = [t for t in tasks if t.get("status") == "done"]
+    failed   = [t for t in tasks if t.get("status") == "failed"]
+    polling  = [t for t in tasks if t.get("status") == "polling"]
+    skipped  = [t for t in tasks if t.get("status") == "skip"]
+    uploaded = [t for t in done   if t.get("drive_link")]
+
+    # Average actual time per completed clip
+    timed = [t for t in done
+             if t.get("completed_at") and t.get("submitted_at")]
+    if timed:
+        avg_sec = sum(t["completed_at"] - t["submitted_at"] for t in timed) / len(timed)
+    else:
+        avg_sec = KLING_EST_SEC
+
+    # ETA: Kling processes tasks with some concurrency — we assume ~3 parallel slots
+    concurrency  = 3
+    eta_sec      = max(0, (len(polling) / max(concurrency, 1)) * avg_sec)
+
+    # Start time from earliest submission
+    submit_times = [t.get("submitted_at", time.time()) for t in tasks if t.get("submitted_at")]
+    start_time   = min(submit_times) if submit_times else time.time()
+    elapsed_sec  = time.time() - start_time
+
+    # Absolute finish time
+    finish_ts    = time.time() + eta_sec
+    finish_str   = time.strftime("%H:%M", time.localtime(finish_ts))
+
+    return {
+        "total":    total,
+        "done":     len(done),
+        "failed":   len(failed),
+        "polling":  len(polling),
+        "skipped":  len(skipped),
+        "uploaded": len(uploaded),
+        "avg_sec":  avg_sec,
+        "eta_sec":  eta_sec,
+        "elapsed":  elapsed_sec,
+        "finish":   finish_str,
+        "pct":      int(len(done) / max(total - len(skipped), 1) * 100),
+    }
+
+def metrics_html(m: dict) -> str:
+    bar_filled = int(m["pct"] / 10)
+    bar = "█" * bar_filled + "░" * (10 - bar_filled)
+    return f"""
+<div style="background:#0c0b18;border:1px solid #1a1730;border-radius:6px;
+  padding:1rem 1.2rem;font-family:'Space Mono',monospace;margin:.5rem 0;">
+<div style="color:#4a4468;font-size:.65rem;letter-spacing:.18em;
+  text-transform:uppercase;margin-bottom:.7rem;">TASK MONITOR</div>
+<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));
+  gap:.6rem .8rem;margin-bottom:.8rem;">
+  <div><div style="color:#3d3660;font-size:.6rem;letter-spacing:.1em;">TOTAL</div>
+       <div style="color:#c8c0dc;font-size:1.05rem;font-weight:700;">{m["total"]}</div></div>
+  <div><div style="color:#3d3660;font-size:.6rem;letter-spacing:.1em;">DONE</div>
+       <div style="color:#34d399;font-size:1.05rem;font-weight:700;">{m["done"]}</div></div>
+  <div><div style="color:#3d3660;font-size:.6rem;letter-spacing:.1em;">IN QUEUE</div>
+       <div style="color:#a78bfa;font-size:1.05rem;font-weight:700;">{m["polling"]}</div></div>
+  <div><div style="color:#3d3660;font-size:.6rem;letter-spacing:.1em;">FAILED</div>
+       <div style="color:#f87171;font-size:1.05rem;font-weight:700;">{m["failed"]}</div></div>
+  <div><div style="color:#3d3660;font-size:.6rem;letter-spacing:.1em;">DRIVE UP</div>
+       <div style="color:#34d399;font-size:1.05rem;font-weight:700;">{m["uploaded"]}</div></div>
+  <div><div style="color:#3d3660;font-size:.6rem;letter-spacing:.1em;">ELAPSED</div>
+       <div style="color:#9d94b0;font-size:1.05rem;font-weight:700;">{fmt_dur(m["elapsed"])}</div></div>
+  <div><div style="color:#3d3660;font-size:.6rem;letter-spacing:.1em;">ETA</div>
+       <div style="color:#c8c0dc;font-size:1.05rem;font-weight:700;">{fmt_dur(m["eta_sec"])}</div></div>
+  <div><div style="color:#3d3660;font-size:.6rem;letter-spacing:.1em;">AVG/CLIP</div>
+       <div style="color:#9d94b0;font-size:1.05rem;font-weight:700;">{fmt_dur(m["avg_sec"])}</div></div>
+</div>
+<div style="font-size:.75rem;color:#4a4468;margin-bottom:.3rem;">
+  PROGRESS  {m["pct"]}%  <span style="color:#a78bfa;letter-spacing:.05em;">{bar}</span>
+</div>
+<div style="font-size:.7rem;color:#3d3660;">
+  Est. completion at <span style="color:#9d94b0;">{m["finish"]}</span> local time
+  ·  {m["done"]}/{m["total"] - m["skipped"]} clips done
+  {"· <span style=\"color:#34d399\">Drive uploads active</span>" if m["uploaded"] > 0 else ""}
+</div>
+</div>"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  BACKGROUND POLLING WORKER
+# ─────────────────────────────────────────────────────────────────────────────
+def _bg_poll_worker(session_id: str, ak: str, sk: str):
+    """
+    Daemon thread: polls every 10 seconds until all tasks are settled.
+    Writes completed video to Google Drive immediately when available.
+    Updates _TASK_REG[session_id] and saves to TASK_FILE for reconnect.
+    """
+    while True:
+        with _REG_LOCK:
+            tasks = _TASK_REG.get(session_id, [])
+
+        pending = [t for t in tasks if t.get("status") == "polling"]
+        if not pending:
+            with _REG_LOCK:
+                _TASK_REG[session_id + "_done"] = True
+            save_task_file(tasks)
+            break
+
+        for task in pending:
+            try:
+                r = requests.get(
+                    f"{KLING_BASE}/v1/videos/image2video/{task['task_id']}",
+                    headers=kh(ak, sk), timeout=30)
+                r.raise_for_status()
+                d = r.json().get("data", {})
+                s = d.get("task_status", "processing")
+
+                if s == "succeed":
+                    try:
+                        url = d["task_result"]["videos"][0]["url"]
+                    except (KeyError, IndexError):
+                        task["status"] = "failed"; task["error"] = "no URL in response"
+                        continue
+
+                    task["url"]          = url
+                    task["status"]       = "done"
+                    task["completed_at"] = time.time()
+
+                    # Immediately upload to Drive if configured
+                    if drive_configured():
+                        try:
+                            vid_data = requests.get(url, timeout=120).content
+                            link = drive_upload(vid_data, task["filename"], "video/mp4")
+                            task["drive_link"]   = link
+                            task["drive_status"] = "uploaded"
+                        except Exception as de:
+                            task["drive_status"] = f"upload failed: {de}"
+
+                elif s in ("failed", "error"):
+                    task["status"] = "failed"
+                    task["error"]  = d.get("task_status_msg", "Kling reported failure")
+
+            except Exception:
+                pass   # Don't kill the thread on transient network errors
+
+        save_task_file(tasks)
+        time.sleep(10)
+
+
+def start_background_polling(session_id: str, ak: str, sk: str):
+    t = threading.Thread(
+        target=_bg_poll_worker,
+        args=(session_id, ak, sk),
+        daemon=True,       # thread dies if main process exits
+        name=f"kling_poll_{session_id[:8]}")
+    t.start()
+    return t
+
+
 def build_zip(chunks):
     buf = io.BytesIO()
     done = [c for c in chunks if c["status"] == "done" and c["output_url"]]
@@ -813,6 +1055,15 @@ with st.sidebar:
                               placeholder="cinematic, sharp detail…")
 
 
+    st.markdown('<div class="sec">GOOGLE DRIVE</div>', unsafe_allow_html=True)
+    if drive_configured():
+        st.markdown('<span style="color:#34d399;font-size:.72rem;">connected — Drive backup active</span>',
+                    unsafe_allow_html=True)
+    else:
+        st.markdown('<span style="color:#3d3660;font-size:.72rem;">not configured</span>',
+                    unsafe_allow_html=True)
+        st.caption("Add secrets to enable auto-backup (see setup guide in Puppeteer tab)")
+
     if st.session_state.log:
         st.markdown('<div class="sec">LOG</div>', unsafe_allow_html=True)
         with st.expander("Show log", expanded=False):
@@ -839,6 +1090,95 @@ tab1, tab2, tab3, tab4 = st.tabs(["PUPPETEER", "ANIMATE", "IMAGINE", "EDIT"])
 #  TAB 1  PUPPETEER
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab1:
+
+    # ── TASK MONITOR  (shown when background tasks are active or resumable) ──
+    session_id = st.session_state.session_id
+
+    # Auto-load saved task state for reconnect
+    if not st.session_state.bg_tasks and not st.session_state.bg_resumed:
+        saved = load_task_file()
+        if saved and any(t.get("status") == "polling" for t in saved):
+            st.session_state.bg_tasks    = saved
+            st.session_state.bg_active   = True
+            st.session_state.bg_resumed  = True
+            # Re-register tasks in global registry
+            with _REG_LOCK:
+                _TASK_REG[session_id] = saved
+            # Restart polling thread for remaining tasks
+            if st.session_state.get("ak_saved") and st.session_state.get("sk_saved"):
+                start_background_polling(
+                    session_id,
+                    st.session_state.ak_saved,
+                    st.session_state.sk_saved)
+
+    # Show monitor whenever we have background tasks
+    bg_tasks = _TASK_REG.get(session_id, st.session_state.bg_tasks)
+    if bg_tasks:
+        m = calc_eta(bg_tasks)
+        st.markdown(metrics_html(m), unsafe_allow_html=True)
+
+        # Auto-refresh every 12 seconds while tasks are in flight
+        if m["polling"] > 0:
+            st.caption(
+                f"Auto-refreshing every 12 seconds.  "
+                f"You can close this tab — Kling continues processing on their servers, "
+                f"and your Drive folder will receive completed clips automatically.")
+            time.sleep(12)
+            st.rerun()
+        else:
+            all_done = m["done"] + m["failed"] == m["total"] - m["skipped"]
+            if all_done:
+                st.success(
+                    f"All tasks settled — {m['done']} done, {m['failed']} failed.  "
+                    + (f"{m['uploaded']} clips uploaded to Drive." if m["uploaded"] > 0 else ""))
+                st.session_state.bg_active = False
+
+        # Task detail table
+        rows = ""
+        for t in bg_tasks:
+            if t.get("status") == "skip": continue
+            sc = {"done":"hlg","failed":"err","polling":"","wait":""}.get(t.get("status",""),"")
+            drv = ""
+            if t.get("drive_link"):
+                drv = f'<a href="{t["drive_link"]}" target="_blank" style="color:#34d399;font-size:.65rem;">↗ Drive</a>'
+            elif t.get("drive_status","").startswith("upload failed"):
+                drv = '<span style="color:#f87171;font-size:.65rem;">⚠ upload err</span>'
+            elapsed_s = ""
+            if t.get("completed_at") and t.get("submitted_at"):
+                elapsed_s = f'{int(t["completed_at"]-t["submitted_at"])}s'
+            rows += (f'<tr><td class="muted">{t["index"]+1:04d}</td>'
+                     f'<td class="{sc}">{t.get("status","?").upper()}</td>'
+                     f'<td class="muted">{elapsed_s}</td>'
+                     f'<td>{drv}</td></tr>')
+        st.markdown(
+            f'<table class="mt"><thead><tr>'
+            f'<th>#</th><th>STATUS</th><th>TIME</th><th>DRIVE</th>'
+            f'</tr></thead><tbody>{rows}</tbody></table>',
+            unsafe_allow_html=True)
+
+        # ZIP download from completed tasks
+        done_tasks = [t for t in bg_tasks if t.get("status") == "done" and t.get("url")]
+        if done_tasks:
+            if st.button(f"Build ZIP from {len(done_tasks)} completed clips", key="bg_zip"):
+                with st.spinner("Building ZIP…"):
+                    buf = io.BytesIO()
+                    lines = ["chunk,filename,status,drive_link,url"]
+                    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+                        for t in done_tasks:
+                            r2 = requests.get(t["url"], timeout=120); r2.raise_for_status()
+                            zf.writestr(t["filename"], r2.content)
+                            lines.append(f"{t['index']+1},{t['filename']},"
+                                         f"{t.get('status','')},{t.get('drive_link','')},{t['url']}")
+                        zf.writestr("MANIFEST.csv", "\n".join(lines))
+                    zip_data = buf.getvalue()
+                if drive_configured():
+                    drive_upload(zip_data, "motion_transfer_background.zip", "application/zip")
+                st.download_button("Download ZIP", data=zip_data,
+                                   file_name="motion_transfer_output.zip",
+                                   mime="application/zip", type="primary")
+
+        st.markdown('<div class="sec">NEW JOB</div>', unsafe_allow_html=True)
+
 
     # ── GUIDE VIDEO ──────────────────────────────────────────────────────────
     st.markdown('<div class="sec">GUIDE VIDEO</div>', unsafe_allow_html=True)
@@ -1122,11 +1462,130 @@ with tab1:
             st.caption("No processable chunks.")
         else:
             est = n_proc * per
-            go = st.button(
-                f"Generate  {n_proc} clips  ·  {chosen_api}  ·  {vid_model}  ·  est. {usd(est)}",
-                type="primary", disabled=st.session_state.processing, key="go1")
+            st.caption(
+                f"**Mode A — Submit & Exit** submits all {n_proc} chunks to Kling in one pass "
+                f"(~{n_proc*2}–{n_proc*4} seconds), then a background thread polls and uploads "
+                f"each result to Drive as it finishes. You can close this browser tab immediately "
+                f"after submission.  |  "
+                f"**Mode B — Wait Here** does the same but streams results live to this page.")
 
-            if go:
+            col_a, col_b = st.columns(2)
+            with col_a:
+                go_bg = st.button(
+                    f"Submit & Exit  ·  {n_proc} clips  ·  {chosen_api}  ·  est. {usd(est)}",
+                    type="primary", disabled=st.session_state.processing or not drive_configured(),
+                    key="go_bg",
+                    help="Submits all tasks to Kling, starts background polling, uploads to Drive. "
+                         "Requires Google Drive to be configured in Secrets.")
+                if not drive_configured():
+                    st.caption("Drive not configured — see setup guide at the bottom of this tab.")
+            with col_b:
+                go_wait = st.button(
+                    f"Wait Here  ·  {n_proc} clips  ·  {chosen_api}  ·  est. {usd(est)}",
+                    disabled=st.session_state.processing, key="go_wait",
+                    help="Submits and polls inline. Keep this tab open.")
+
+            # ── SHARED EXTRACTION HELPER ──────────────────────────────────────
+            def extract_one_chunk(ch, act_vb, act_fps):
+                cs2    = st.session_state.chunk_settings.get(ch["index"], {})
+                in_pt  = cs2.get("in_pt",  0.0)
+                out_pt = cs2.get("out_pt", ch["duration"])
+                eff_s  = ch["start"] + in_pt
+                eff_e  = ch["start"] + out_pt
+                if cs2.get("crop_en") and cs2.get("cw", 0) > 0:
+                    seg = extract_seg(act_vb, eff_s, eff_e, act_fps)
+                    seg = do_crop(seg, cs2["cx"], cs2["cy"], cs2["cw"], cs2["ch"])
+                else:
+                    seg = extract_seg(act_vb, eff_s, eff_e, act_fps)
+                return fit_chunk_for_api(seg), eff_s, eff_e
+
+            # ── MODE A: SUBMIT & EXIT ─────────────────────────────────────────
+            if go_bg:
+                st.session_state.processing = True
+                prog = st.progress(0, text="Extracting and submitting all chunks…")
+                stat = st.empty()
+                try:
+                    img64    = b64(st.session_state.image_bytes)
+                    sid      = st.session_state.session_id
+                    task_list = []
+
+                    for ch in chunks:
+                        i = ch["index"]
+                        if ch["status"] == "skip":
+                            task_list.append({**ch, "task_id": None, "url": None,
+                                              "drive_link": None, "drive_status": "",
+                                              "submitted_at": None, "completed_at": None})
+                            continue
+
+                        pct = int((i / len(chunks)) * 90)
+                        prog.progress(pct, text=f"Submitting chunk {i+1}/{len(chunks)}…")
+                        stat.info(f"Extracting + submitting chunk {i+1}…")
+
+                        try:
+                            seg, eff_s, eff_e = extract_one_chunk(ch, act_vb, act_fps)
+                            vid64 = b64(seg)
+                            alog(f"Chunk {i+1}: {len(seg)//1024}KB")
+
+                            if chosen_api == "Kling AI":
+                                tid = kling_motion_transfer(ak, sk, img64, vid64,
+                                                            API_MAX_SEC, vid_model, prompt_txt)
+                            else:
+                                tid = runway_motion(rk, img64, vid64, API_MAX_SEC,
+                                                    vid_model, prompt_txt)
+
+                            task_list.append({
+                                **ch,
+                                "task_id":      tid,
+                                "status":       "polling",
+                                "url":          None,
+                                "drive_link":   None,
+                                "drive_status": "",
+                                "submitted_at": time.time(),
+                                "completed_at": None,
+                            })
+                            alog(f"Chunk {i+1}: submitted → {tid}")
+
+                        except Exception as e:
+                            task_list.append({**ch, "task_id": None, "status": "failed",
+                                              "error": str(e), "url": None,
+                                              "drive_link": None, "drive_status": "",
+                                              "submitted_at": time.time(), "completed_at": None})
+                            alog(f"Chunk {i+1}: submit failed — {e}")
+
+                    # Register tasks globally and start background thread
+                    with _REG_LOCK:
+                        _TASK_REG[sid] = task_list
+                    st.session_state.bg_tasks  = task_list
+                    st.session_state.bg_active = True
+                    # Save API keys for reconnect polling
+                    st.session_state.ak_saved  = ak
+                    st.session_state.sk_saved  = sk
+
+                    save_task_file(task_list)
+
+                    # Upload task manifest to Drive so user has IDs even if session dies
+                    if drive_configured():
+                        manifest = json.dumps(task_list, indent=2).encode()
+                        drive_upload(manifest, "_task_manifest.json", "application/json")
+
+                    start_background_polling(sid, ak, sk)
+
+                    prog.progress(100, text="All tasks submitted.")
+                    n_submitted = sum(1 for t in task_list if t.get("task_id"))
+                    stat.success(
+                        f"{n_submitted}/{n_proc} tasks submitted to Kling.  "
+                        f"Background polling started.  "
+                        f"You can now close this tab — results will appear in Drive automatically.  "
+                        f"ETA: ~{fmt_dur(n_submitted * KLING_EST_SEC / 3)} "
+                        f"(assuming ~3 parallel slots)")
+
+                except Exception as e:
+                    stat.error(str(e)); alog(str(e))
+                finally:
+                    st.session_state.processing = False
+
+            # ── MODE B: WAIT HERE ─────────────────────────────────────────────
+            if go_wait:
                 for k2, v2 in dict(t1_chunks=[], t1_results=[], t1_zip=None,
                                    t1_csv="", t1_cost=0.0, log=[]).items():
                     st.session_state[k2] = v2
@@ -1140,28 +1599,16 @@ with tab1:
                     for ch in chunks:
                         i = ch["index"]
                         if ch["status"] == "skip":
-                            alog(f"Chunk {i+1}: skip ({ch['duration']:.2f}s)")
-                            continue
+                            alog(f"Chunk {i+1}: skip"); continue
                         pct = int(5 + (done_n / max(n_proc, 1)) * 90)
                         prog.progress(pct, text=f"Chunk {i+1}/{len(chunks)}")
                         ch["status"] = "run"
                         grid.markdown(chunk_grid_html(chunks, None, act_fps),
                                       unsafe_allow_html=True)
                         try:
-                            cs2    = st.session_state.chunk_settings.get(i, {})
-                            in_pt  = cs2.get("in_pt",  0.0)
-                            out_pt = cs2.get("out_pt", ch["duration"])
-                            eff_s  = ch["start"] + in_pt
-                            eff_e  = ch["start"] + out_pt
-                            stat.info(f"Extracting chunk {i+1}  "
-                                      f"({sec_tc(eff_s, act_fps)} → {sec_tc(eff_e, act_fps)})…")
-                            if cs2.get("crop_en") and cs2.get("cw", 0) > 0:
-                                seg = extract_seg(act_vb, eff_s, eff_e, act_fps)
-                                seg = do_crop(seg, cs2["cx"], cs2["cy"], cs2["cw"], cs2["ch"])
-                            else:
-                                seg = extract_seg(act_vb, eff_s, eff_e, act_fps)
-                            seg = fit_chunk_for_api(seg)  # resize if > 6 MB
-                            alog(f"Chunk {i+1}: {len(seg)//1024}KB after fit")
+                            stat.info(f"Extracting chunk {i+1}…")
+                            seg, eff_s, eff_e = extract_one_chunk(ch, act_vb, act_fps)
+                            alog(f"Chunk {i+1}: {len(seg)//1024}KB")
                             vid64 = b64(seg)
                             stat.info(f"Submitting chunk {i+1} to {chosen_api}…")
                             if chosen_api == "Kling AI":
@@ -1179,13 +1626,19 @@ with tab1:
                             st.session_state.t1_results.append(url)
                             st.session_state.t1_cost = cost_now
                             alog(f"Chunk {i+1}: done")
+                            if drive_configured():
+                                try:
+                                    vid_data = requests.get(url, timeout=120).content
+                                    drive_upload(vid_data, ch["filename"], "video/mp4")
+                                except: pass
                         except Exception as e:
                             ch["status"] = "fail"
                             alog(f"Chunk {i+1} FAILED: {e}")
                             st.warning(f"Chunk {i+1} failed: {e}")
                         grid.markdown(chunk_grid_html(chunks, None, act_fps),
                                       unsafe_allow_html=True)
-                        clive.caption(f"Cost so far: {usd(cost_now)}  ·  {done_n} clips done")
+                        clive.caption(f"Cost so far: {usd(cost_now)}  ·  {done_n} done  ·  "
+                                      f"ETA: {fmt_dur((n_proc-done_n)*KLING_EST_SEC/3)}")
                     done_ch = [c for c in chunks if c["status"] == "done"]
                     if done_ch:
                         prog.progress(97, text="Building ZIP…")
@@ -1193,6 +1646,8 @@ with tab1:
                             zb, mc = build_zip(chunks)
                             st.session_state.t1_zip = zb
                             st.session_state.t1_csv = mc
+                            if drive_configured():
+                                drive_upload(zb, "motion_transfer_output.zip", "application/zip")
                         except Exception as ze:
                             st.warning(f"ZIP failed: {ze}")
                     prog.progress(100, text="Complete")
@@ -1224,6 +1679,67 @@ with tab1:
                                f"{sec_tc(c['start'])} → {sec_tc(c['end'])}  "
                                f"{c['duration']:.3f}s")
                     st.video(c["output_url"])
+
+    with st.expander("Google Drive setup guide — how to connect your personal Drive"):
+        st.markdown("""
+**Why connect Google Drive?**
+
+When you use *Submit & Exit* mode, the app submits all tasks to Kling then polls
+them in the background. As each clip finishes, it is uploaded directly to your
+Google Drive folder. You can close this browser tab, shut down your computer, and
+come back hours later to find everything waiting in Drive.
+
+**Step-by-step setup (one-time, ~10 minutes)**
+
+**1. Create a Google Cloud project**
+- Go to [console.cloud.google.com](https://console.cloud.google.com)
+- Click *Select a project* → *New Project* → give it any name → *Create*
+
+**2. Enable the Drive API**
+- In your project, go to *APIs & Services* → *Library*
+- Search for **Google Drive API** → click it → *Enable*
+
+**3. Create a Service Account**
+- Go to *APIs & Services* → *Credentials* → *Create Credentials* → *Service Account*
+- Give it any name (e.g. `motion-transfer-bot`) → *Done*
+- Click the service account you just created → *Keys* tab → *Add Key* → *Create new key* → **JSON**
+- A JSON file downloads to your computer — keep it safe, treat it like a password
+
+**4. Share your Drive folder with the service account**
+- In Google Drive, create a new folder (e.g. `Motion Transfer Output`)
+- Right-click the folder → *Share* → paste the service account email address
+  (it looks like `motion-transfer-bot@your-project.iam.gserviceaccount.com` — found inside the JSON file as `"client_email"`)
+- Set permission to **Editor** → *Send*
+
+**5. Get the folder ID**
+- Open the folder in Drive — the URL looks like:
+  `https://drive.google.com/drive/folders/1aBcDeFgHiJkLmNoPqRsTuVwXyZ`
+- The folder ID is the long string at the end: `1aBcDeFgHiJkLmNoPqRsTuVwXyZ`
+
+**6. Add secrets to Streamlit Cloud**
+- In your app dashboard on share.streamlit.io → *Settings* → *Secrets*
+- Add these two lines:
+
+```toml
+GOOGLE_SERVICE_ACCOUNT_JSON = '{"type":"service_account","project_id":"...","private_key_id":"...","private_key":"-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----\n","client_email":"motion-transfer-bot@...iam.gserviceaccount.com","client_id":"...","auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token"}'
+GOOGLE_DRIVE_FOLDER_ID = "1aBcDeFgHiJkLmNoPqRsTuVwXyZ"
+```
+
+Paste the **entire JSON file contents** as a single line in the first secret.
+The sidebar will show *connected* when the credentials are valid.
+
+**What gets saved to Drive?**
+- Each rendered clip as soon as it finishes (e.g. `chunk_0001_TC_...mp4`)
+- A task manifest JSON (`_task_manifest.json`) right after submission — contains all task IDs so you can recover if the session times out
+- The final ZIP with all clips and MANIFEST.csv when you click *Build ZIP*
+
+**Session timeout on Streamlit Community Cloud**
+The background polling thread runs as long as the Streamlit server process lives.
+On the free tier, sessions time out after approximately 15 minutes of browser inactivity.
+For a 30-clip job (~3 min each, 3 parallel), most clips complete in 10 minutes — well within the window.
+For longer jobs, the task manifest in Drive contains all task IDs so you can
+resume monitoring in a new session.
+        """)
 
     with st.expander("About this tab — PUPPETEER"):
         st.markdown("""
