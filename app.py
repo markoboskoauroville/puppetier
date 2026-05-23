@@ -333,13 +333,13 @@ def k_poll_img(ak,sk,tid,endpoint="generations",mw=300,status_cb=None,t0=None):
         if s in("failed","error"): raise RuntimeError(d.get("task_status_msg","failed"))
         time.sleep(5)
 
-def kling_motion_transfer(ak,sk,img_b64,vid_b64,dur,model,prompt):
+def kling_motion_transfer(ak,sk,img_b64,vid_b64,dur,model,prompt,neg_prompt=""):
     mode="pro" if model=="pro" else "std"
     d=k_post(ak,sk,"/v1/videos/image2video",{
         "model_name":"kling-v1-5","image":img_b64,"motion_video":vid_b64,
         "duration":int(dur),"mode":mode,"cfg_scale":0.5,
         "prompt":prompt or "smooth motion, high quality, cinematic",
-        "negative_prompt":"blur, artifacts, distortion, watermark"})
+        "negative_prompt":neg_prompt or "blur, artifacts, distortion, watermark"})
     tid=d.get("data",{}).get("task_id","")
     if not tid: raise ValueError(f"No task_id: {d}")
     return tid
@@ -856,12 +856,12 @@ if not ffok():
 # ─────────────────────────────────────────────────────────────────────────────
 #  TABS
 # ─────────────────────────────────────────────────────────────────────────────
-tab1,tab2,tab3,tab4,tab5,tab6 = st.tabs(["PUPPETEER","ANIMATE","IMAGINE","EDIT","HISTORY","SETTINGS"])
+tab_an,tab_im,tab_ed,tab_pu,tab_hi,tab_se = st.tabs(["ANIMATE","IMAGINE","EDIT","PUPPETEER","HISTORY","SETTINGS"])
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TAB 5 — HISTORY
 # ═══════════════════════════════════════════════════════════════════════════════
-with tab5:
+with tab_hi:
 
     st.markdown('<div class="sec">PULL FROM KLING</div>',unsafe_allow_html=True)
     st.caption("Kling keeps results ~30 days. Pull here to recover work "
@@ -1057,7 +1057,7 @@ Top up at klingai.com → Developer Console → Credits.
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TAB 6 — SETTINGS
 # ═══════════════════════════════════════════════════════════════════════════════
-with tab6:
+with tab_se:
     st.markdown('<div class="sec">API ENGINE</div>',unsafe_allow_html=True)
     st.session_state.chosen_api=st.radio(
         "API",["Kling AI","RunwayML"],
@@ -1266,7 +1266,7 @@ def _prompt(): return st.session_state.style_prompt
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TAB 1 — PUPPETEER
 # ═══════════════════════════════════════════════════════════════════════════════
-with tab1:
+with tab_pu:
 
     # ── TASK MONITOR ─────────────────────────────────────────────────────────
     sid=st.session_state.session_id
@@ -1541,6 +1541,20 @@ with tab1:
                                   st.session_state.vid_model,API_MAX_SEC),
                     unsafe_allow_html=True)
 
+        # ── PROMPT ──────────────────────────────────────────────────────────
+        st.markdown('<div class="sec">PROMPT</div>',unsafe_allow_html=True)
+        st.markdown('<div style="color:#fff;font-size:.7rem;font-family:monospace;'
+                    'margin-bottom:.2rem;">PROMPT — sent to Kling as positive guidance</div>',
+                    unsafe_allow_html=True)
+        pu_prompt=st.text_area("Prompt","",
+            placeholder="smooth motion, cinematic, high quality, sharp detail",
+            key="pu_prompt",label_visibility="collapsed",height=60)
+        st.markdown('<div style="color:#555;font-size:.7rem;font-family:monospace;'
+                    'margin:.4rem 0 .2rem;">NEGATIVE PROMPT — sent to Kling to suppress unwanted output</div>',
+                    unsafe_allow_html=True)
+        pu_neg=st.text_input("Negative","blur, artifacts, distortion, watermark, low quality",
+                             key="pu_neg",label_visibility="collapsed")
+
         # ── GENERATE ────────────────────────────────────────────────────────
         st.markdown('<div class="sec">GENERATE</div>',unsafe_allow_html=True)
 
@@ -1600,14 +1614,17 @@ with tab1:
                             if st.session_state.chosen_api=="Kling AI":
                                 tid=kling_motion_transfer(active_ak(),active_sk(),
                                                           img64,vid64,API_MAX_SEC,
-                                                          st.session_state.vid_model,_prompt())
+                                                          st.session_state.vid_model,
+                                                          pu_prompt or _prompt(),pu_neg)
                             else:
                                 tid=runway_motion(active_rk(),img64,vid64,API_MAX_SEC,
-                                                  st.session_state.vid_model,_prompt())
+                                                  st.session_state.vid_model,
+                                                  pu_prompt or _prompt())
                             task_list.append({**ch,"task_id":tid,"status":"polling",
                                               "url":None,"submitted_at":time.time(),
                                               "completed_at":None,"sheet_logged":False,
-                                              "prompt":_prompt(),"model":st.session_state.vid_model})
+                                              "prompt":pu_prompt or _prompt(),
+                                              "model":st.session_state.vid_model})
                             alog(f"Chunk {i+1}: submitted {tid}")
                         except Exception as e:
                             task_list.append({**ch,"task_id":None,"status":"failed",
@@ -1656,14 +1673,16 @@ with tab1:
                             if st.session_state.chosen_api=="Kling AI":
                                 tid=kling_motion_transfer(active_ak(),active_sk(),
                                                           img64,vid64,API_MAX_SEC,
-                                                          st.session_state.vid_model,_prompt())
+                                                          st.session_state.vid_model,
+                                                          pu_prompt or _prompt(),pu_neg)
                                 _url=k_poll_vid(active_ak(),active_sk(),tid,
                                     status_cb=lambda _t,_e,_s=stat:
                                         _s.info(f"Polling {_t[:12]}… ⏱ {fmt_dur(int(_e))}"),
                                     t0=_t0)
                             else:
                                 tid=runway_motion(active_rk(),img64,vid64,API_MAX_SEC,
-                                                  st.session_state.vid_model,_prompt())
+                                                  st.session_state.vid_model,
+                                                  pu_prompt or _prompt())
                                 _url=runway_poll(active_rk(),tid,
                                     status_cb=lambda _t,_e,_s=stat:
                                         _s.info(f"Polling {_t[:12]}… ⏱ {fmt_dur(int(_e))}"),
@@ -1718,7 +1737,7 @@ with tab1:
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TAB 2 — ANIMATE
 # ═══════════════════════════════════════════════════════════════════════════════
-with tab2:
+with tab_an:
     st.markdown('<div class="sec">STILL</div>',unsafe_allow_html=True)
     a_img=st.file_uploader("Still",type=["jpg","jpeg","png","webp"],
                            key="a_img",label_visibility="collapsed")
@@ -1729,8 +1748,14 @@ with tab2:
         show_image(a_img)
 
     st.markdown('<div class="sec">SETTINGS</div>',unsafe_allow_html=True)
+    st.markdown('<div style="color:#fff;font-size:.7rem;font-family:monospace;'
+                'margin-bottom:.2rem;">PROMPT — positive guidance sent to Kling</div>',
+                unsafe_allow_html=True)
     a_prompt=st.text_area("Prompt","",placeholder="the figure slowly turns and waves",
                           key="a_prompt",label_visibility="collapsed",height=70)
+    st.markdown('<div style="color:#555;font-size:.7rem;font-family:monospace;'
+                'margin:.35rem 0 .15rem;">NEGATIVE PROMPT — what to suppress</div>',
+                unsafe_allow_html=True)
     a_neg=st.text_input("Negative","blur, artifacts, watermark",
                         key="a_neg",label_visibility="collapsed")
     a_dur_r=st.radio("Duration",["5s","10s"],horizontal=True,
@@ -1790,11 +1815,17 @@ with tab2:
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TAB 3 — IMAGINE
 # ═══════════════════════════════════════════════════════════════════════════════
-with tab3:
+with tab_im:
     st.markdown('<div class="sec">PROMPT</div>',unsafe_allow_html=True)
+    st.markdown('<div style="color:#fff;font-size:.7rem;font-family:monospace;'
+                'margin-bottom:.2rem;">PROMPT — positive image description sent to Kling</div>',
+                unsafe_allow_html=True)
     i_prompt=st.text_area("Prompt","",
                           placeholder="full body portrait, dancer, dramatic lighting, cinematic",
                           key="i_prompt",label_visibility="collapsed",height=90)
+    st.markdown('<div style="color:#555;font-size:.7rem;font-family:monospace;'
+                'margin:.35rem 0 .15rem;">NEGATIVE PROMPT — elements to exclude from image</div>',
+                unsafe_allow_html=True)
     i_neg=st.text_input("Negative","blur, text, watermark, artifacts",
                         key="i_neg",label_visibility="collapsed")
 
@@ -1864,7 +1895,7 @@ with tab3:
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TAB 4 — EDIT
 # ═══════════════════════════════════════════════════════════════════════════════
-with tab4:
+with tab_ed:
     st.markdown('<div class="sec">MODE</div>',unsafe_allow_html=True)
     edit_mode=st.radio("Mode",list(KLING_EDIT_PRICE.keys()),
                        horizontal=False,label_visibility="collapsed")
@@ -1897,9 +1928,15 @@ with tab4:
             "Variation":"same scene, oil painting style, warm tones",
             "Extend Canvas":"continue background naturally, match lighting",
         }
+        st.markdown('<div style="color:#fff;font-size:.7rem;font-family:monospace;'
+                    'margin-bottom:.2rem;">PROMPT — describe the desired edit, sent to Kling</div>',
+                    unsafe_allow_html=True)
         e_prompt=st.text_area("Prompt","",
                               placeholder=mode_placeholders.get(edit_mode,""),
                               key="e_prompt",label_visibility="collapsed",height=70)
+        st.markdown('<div style="color:#555;font-size:.7rem;font-family:monospace;'
+                    'margin:.35rem 0 .15rem;">NEGATIVE PROMPT — what to suppress in output</div>',
+                    unsafe_allow_html=True)
         e_neg=st.text_input("Negative","blur, artifacts",
                             key="e_neg",label_visibility="collapsed")
         e_fid=st.slider("Fidelity",0.0,1.0,
