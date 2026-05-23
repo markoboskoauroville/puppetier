@@ -1,5 +1,6 @@
-# Motion Transfer Studio v9
-# B&W · No sidebar · Settings tab · Google Sheets log · Kling history pull
+# Motion Transfer Studio v9d — Streamlit Cloud / GitHub version
+# Secrets loaded from Streamlit Cloud → app Settings → Secrets
+# All results logged to Google Sheet + /tmp/klinglog.txt (session-level)
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -10,6 +11,7 @@ from fractions import Fraction
 _TASK_REG = {}
 _REG_LOCK = threading.Lock()
 TASK_FILE = "/tmp/mts_tasks.json"
+KLING_LOG = "/tmp/klinglog.txt"
 
 st.set_page_config(page_title="MTS", page_icon=None,
                    layout="wide", initial_sidebar_state="collapsed")
@@ -234,8 +236,22 @@ def sec_tc(s, fps=25):
 def tc_fn(s): return sec_tc(s).replace(":","_")
 def usd(v): return f"${v:.3f}" if v<.1 else f"${v:.2f}"
 def alog(m): st.session_state.log.append(f"[{time.strftime('%H:%M:%S')}] {m}")
+
+def local_log(message: str):
+    """Append to /tmp/klinglog.txt — persists for the session duration on Streamlit Cloud."""
+    try:
+        with open(KLING_LOG, "a", encoding="utf-8") as _lf:
+            _lf.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}\n")
+    except Exception: pass
+
 def gs(k):
+    """Get a secret value from Streamlit Secrets (set in app Settings → Secrets)."""
     try: return st.secrets[k]
+    except: return None
+
+def _get_gcp_sa() -> dict | None:
+    """Return gcp_service_account dict from Streamlit Secrets."""
+    try: return dict(st.secrets["gcp_service_account"])
     except: return None
 def parse_t(s):
     s=s.strip(); p=s.split(":")
@@ -400,15 +416,13 @@ def runway_poll(k,tid,mw=600):
 #  GOOGLE SHEETS
 # ─────────────────────────────────────────────────────────────────────────────
 def sheets_configured():
-    try:
-        return bool(st.secrets.get("GOOGLE_SHEET_URL") and
-                    st.secrets.get("gcp_service_account"))
-    except: return False
+    return bool(gs("GOOGLE_SHEET_URL") and _get_gcp_sa())
 
 def _sheets_svc():
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
-    info=dict(st.secrets["gcp_service_account"])
+    info = _get_gcp_sa()
+    if not info: raise ValueError("No gcp_service_account configured")
     creds=service_account.Credentials.from_service_account_info(
         info,scopes=["https://www.googleapis.com/auth/spreadsheets"])
     return build("sheets","v4",credentials=creds,cache_discovery=False)
@@ -462,6 +476,8 @@ def log_url(tab:str, chunk_num:str, prompt:str, model:str, url:str, notes:str=""
     ts=sheet_ts()  # yyyymmddhhmm in Croatian local time
     link=f'=HYPERLINK("{url}","Download")'
     log_to_sheet([ts,tab,chunk_num,prompt,model,link,notes])
+    # Also write to local klinglog.txt
+    local_log(f"{tab} | #{chunk_num} | {model} | {prompt[:60]} | {url}")
 
 def read_sheet_rows():
     try:
@@ -875,8 +891,15 @@ with tab5:
                         params={"page_num": h_page, "page_size": int(h_size)},
                         timeout=30)
                     r.raise_for_status()
-                    data  = r.json().get("data", {})
-                    tasks = data.get("tasks", data.get("list", []))
+                    raw  = r.json()
+                    data = raw.get("data", raw)   # some versions return list directly
+                    if isinstance(data, list):
+                        tasks = data
+                    elif isinstance(data, dict):
+                        tasks = (data.get("tasks") or data.get("list") or
+                                 data.get("data") or [])
+                    else:
+                        tasks = []
                     st.session_state.h_pulled_tasks = tasks
                     st.session_state.h_pulled_type  = h_type
                     alog(f"Pulled {len(tasks)} tasks ({h_type} p{h_page})")
@@ -957,24 +980,44 @@ with tab5:
         if not (active_ak() and active_sk()):
             st.error("Kling credentials required.")
         else:
-            with st.spinner("Querying…"):
-                found = {}
-                for path in ["/v1/account/costs", "/v1/account/balance",
-                             "/v1/user/balance", "/v1/account/info"]:
+            with st.spinner("Querying Kling account endpoints…"):
+                results = {}
+                # Try every known and speculative endpoint
+                for path in ["/v1/account/costs",
+                             "/v1/account/balance",
+                             "/v1/account/info",
+                             "/v1/user/balance",
+                             "/v1/user/info",
+                             "/account/costs",
+                             "/account/balance"]:
                     try:
                         r = requests.get(f"{KLING_BASE}{path}",
                                          headers=kh(active_ak(), active_sk()),
-                                         timeout=10)
-                        if r.ok:
-                            found[path] = r.json()
-                    except: pass
-                if found:
-                    for path, data in found.items():
-                        st.caption(path)
-                        st.json(data)
+                                         timeout=8)
+                        results[path] = {"status": r.status_code, "body": r.json()}
+                    except Exception as _be:
+                        results[path] = {"status": "error", "body": str(_be)}
+
+                # Show all responses so user can see what Kling returns
+                any_ok = any(v.get("status") == 200 for v in results.values())
+                if any_ok:
+                    for path, res in results.items():
+                        if res.get("status") == 200:
+                            st.caption(f"✓ {path}")
+                            st.json(res["body"])
                 else:
-                    st.warning("No balance endpoint responded. "
-                               "Check klingai.com/developer for account info.")
+                    st.warning(
+                        "Kling AI does not currently expose account balance "
+                        "via the API key system. Check your credit balance at:\n\n"
+                        "**klingai.com → top right avatar → Credits / Billing**\n\n"
+                        "Raw responses from all tried endpoints:")
+                    rows = ""
+                    for path, res in results.items():
+                        code = res.get("status","?")
+                        rows += f"<tr><td style='color:#555'>{path}</td><td style='color:#777'>{code}</td></tr>"
+                    st.markdown(
+                        '<table class="mt"><thead><tr><th>ENDPOINT</th><th>STATUS</th></tr></thead>'
+                        f'<tbody>{rows}</tbody></table>', unsafe_allow_html=True)
 
     with st.expander("Kling storage & pricing reference"):
         st.markdown("""
