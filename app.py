@@ -827,9 +827,178 @@ if not ffok():
 tab1,tab2,tab3,tab4,tab5,tab6 = st.tabs(["PUPPETEER","ANIMATE","IMAGINE","EDIT","HISTORY","SETTINGS"])
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  TAB 5 — SETTINGS (render first so values are available to other tabs)
+#  TAB 5 — HISTORY
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab5:
+
+    st.markdown('<div class="sec">PULL FROM KLING</div>',unsafe_allow_html=True)
+    st.caption("Kling keeps results ~30 days. Pull here to recover work "
+               "after crashes, session loss, or expired browser tabs.")
+
+    h_type = st.radio(
+        "Task type",
+        ["video · image2video","video · text2video","image · generations"],
+        horizontal=False, label_visibility="collapsed")
+    type_map = {
+        "video · image2video": ("video","image2video"),
+        "video · text2video":  ("video","text2video"),
+        "image · generations": ("image","generations"),
+    }
+    h_media, h_endpoint = type_map[h_type]
+
+    hc1, hc2 = st.columns([1,3])
+    with hc1:
+        h_page = st.number_input("Page", 1, 50, 1)
+    with hc2:
+        h_size = st.radio("Per page",["10","20","30","50"],
+                          horizontal=True, label_visibility="collapsed", index=2)
+
+    col_pull, col_log = st.columns(2)
+    with col_pull:
+        do_pull = st.button("Pull from Kling", type="primary", key="h_pull")
+    with col_log:
+        do_log_all = st.button("Log all to Sheet", key="h_log_all",
+                               disabled="h_pulled_tasks" not in st.session_state)
+
+    if do_pull:
+        if not (active_ak() and active_sk()):
+            st.error("Kling credentials required — set them in Settings.")
+        else:
+            with st.spinner("Fetching…"):
+                try:
+                    base_path = (f"/v1/videos/{h_endpoint}"
+                                 if h_media == "video"
+                                 else f"/v1/images/{h_endpoint}")
+                    r = requests.get(
+                        f"{KLING_BASE}{base_path}",
+                        headers=kh(active_ak(), active_sk()),
+                        params={"page_num": h_page, "page_size": int(h_size)},
+                        timeout=30)
+                    r.raise_for_status()
+                    data  = r.json().get("data", {})
+                    tasks = data.get("tasks", data.get("list", []))
+                    st.session_state.h_pulled_tasks = tasks
+                    st.session_state.h_pulled_type  = h_type
+                    alog(f"Pulled {len(tasks)} tasks ({h_type} p{h_page})")
+                except Exception as e:
+                    st.error(f"Pull failed: {e}")
+
+    if "h_pulled_tasks" in st.session_state and st.session_state.h_pulled_tasks:
+        tasks = st.session_state.h_pulled_tasks
+        rows  = ""
+        for t in tasks:
+            status = t.get("task_status","?")
+            created = t.get("created_at","")
+            if isinstance(created,(int,float)):
+                utc_secs = created / 1000
+                month    = time.gmtime(utc_secs).tm_mon
+                offset   = 7200 if 4 <= month <= 10 else 3600
+                created  = time.strftime("%Y%m%d%H%M", time.gmtime(utc_secs + offset))
+            tid = t.get("task_id","")
+            tid_disp = (tid[:14]+"…") if len(tid)>14 else tid
+            url = ""
+            try:
+                res = t.get("task_result",{})
+                if res.get("videos"):   url = res["videos"][0].get("url","")
+                elif res.get("images"): url = res["images"][0].get("url","")
+            except: pass
+            prompt_txt = (t.get("task_input",{}).get("prompt","") or
+                          t.get("prompt",""))[:40]
+            lnk = (f'<a href="{url}" target="_blank" style="color:#ccc;font-weight:700;">↗</a>'
+                   if url else "—")
+            sc  = "hl" if status=="succeed" else ("err" if "fail" in status else "muted")
+            rows += (
+                f'<tr><td class="muted">{created}</td>'
+                f'<td class="muted" style="font-size:.64rem;">{tid_disp}</td>'
+                f'<td class="{sc}">{status}</td>'
+                f'<td class="muted" style="max-width:160px;overflow:hidden;'
+                f'white-space:nowrap;text-overflow:ellipsis;">{prompt_txt}</td>'
+                f'<td>{lnk}</td></tr>'
+            )
+        st.markdown(
+            '<table class="mt"><thead><tr>'
+            '<th>CREATED (CRO)</th><th>TASK ID</th>'
+            '<th>STATUS</th><th>PROMPT</th><th>LINK</th>'
+            '</tr></thead><tbody>' + rows + '</tbody></table>',
+            unsafe_allow_html=True)
+        st.caption(f"{len(tasks)} tasks · page {h_page} · ~30-day storage")
+
+        if do_log_all:
+            if not sheets_configured():
+                st.warning("Sheet not configured — check Settings.")
+            else:
+                logged = 0; skipped = 0
+                with st.spinner("Logging to Sheet…"):
+                    ensure_sheet_header()
+                    for t in tasks:
+                        url = ""
+                        try:
+                            res = t.get("task_result",{})
+                            if res.get("videos"):   url = res["videos"][0].get("url","")
+                            elif res.get("images"): url = res["images"][0].get("url","")
+                        except: pass
+                        if url and t.get("task_status") == "succeed":
+                            try:
+                                prompt_txt = (t.get("task_input",{}).get("prompt","") or
+                                              t.get("prompt","") or "")[:80]
+                                log_url(st.session_state.h_pulled_type,
+                                        t.get("task_id","")[:12],
+                                        prompt_txt, "kling-pull", url,
+                                        "from Kling history")
+                                logged += 1
+                            except: skipped += 1
+                        else: skipped += 1
+                st.success(f"Logged {logged} · skipped {skipped}")
+
+    # ── CREDITS & USAGE ───────────────────────────────────────────────────────
+    st.markdown('<div class="sec">CREDITS & USAGE</div>', unsafe_allow_html=True)
+
+    if st.button("Check Kling balance", key="check_balance"):
+        if not (active_ak() and active_sk()):
+            st.error("Kling credentials required.")
+        else:
+            with st.spinner("Querying…"):
+                found = {}
+                for path in ["/v1/account/costs", "/v1/account/balance",
+                             "/v1/user/balance", "/v1/account/info"]:
+                    try:
+                        r = requests.get(f"{KLING_BASE}{path}",
+                                         headers=kh(active_ak(), active_sk()),
+                                         timeout=10)
+                        if r.ok:
+                            found[path] = r.json()
+                    except: pass
+                if found:
+                    for path, data in found.items():
+                        st.caption(path)
+                        st.json(data)
+                else:
+                    st.warning("No balance endpoint responded. "
+                               "Check klingai.com/developer for account info.")
+
+    with st.expander("Kling storage & pricing reference"):
+        st.markdown("""
+**Storage**  Videos kept ~30 days from generation date. Download before expiry.
+Task IDs remain queryable — Pull tab can fetch a fresh URL within the 30-day window.
+
+**Credits (approximate)**
+
+| Operation | Duration | Mode | Cost |
+|---|---|---|---|
+| image2video | 5s | Standard | $0.045 |
+| image2video | 10s | Standard | $0.070 |
+| image2video | 5s | Professional | $0.090 |
+| image2video | 10s | Professional | $0.140 |
+| Image (Kolors) | — | — | ~$0.008/image |
+| Virtual Try-On | — | — | ~$0.025 |
+
+Top up at klingai.com → Developer Console → Credits.
+        """)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TAB 6 — SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab6:
     st.markdown('<div class="sec">API ENGINE</div>',unsafe_allow_html=True)
     st.session_state.chosen_api=st.radio(
         "API",["Kling AI","RunwayML"],
