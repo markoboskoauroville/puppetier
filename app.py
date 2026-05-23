@@ -186,7 +186,7 @@ VIDEO_SIZE_OPTS = ["25%","33%","50%","75%","100%"]
 VIDEO_SIZE_PX   = {"25%":160, "33%":210, "50%":300, "75%":440, "100%":580}
 VIDEO_SIZE_COL  = {"25%":[1,3], "33%":[1,2], "50%":[1,1], "75%":[3,1], "100%":[10,0]}
 
-SHEET_HEADERS = ["Timestamp","Type","#","Prompt","Model","URL (expires ~30d)","Notes"]
+SHEET_HEADERS = ["YYYYMMDDHHMM (CRO)","Type","#","Prompt","Model","URL (expires ~30d)","Notes"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  SESSION STATE
@@ -430,6 +430,24 @@ def ensure_sheet_header():
                 body={"values":[SHEET_HEADERS]}).execute()
     except Exception as e: alog(f"Sheet header: {e}")
 
+
+def sheet_ts() -> str:
+    """
+    Timestamp as yyyymmddhhmm in Croatian local time (CET/CEST).
+    Uses zoneinfo if available (Python 3.9+), otherwise approximates.
+    Change "Europe/Zagreb" to any IANA timezone string for other regions.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        from datetime import datetime
+        return datetime.now(ZoneInfo("Europe/Zagreb")).strftime("%Y%m%d%H%M")
+    except Exception:
+        # Fallback: UTC+1 (CET) Nov-Mar, UTC+2 (CEST) Apr-Oct
+        utc_secs = time.time()
+        month = time.gmtime(utc_secs).tm_mon
+        offset = 7200 if 4 <= month <= 10 else 3600
+        return time.strftime("%Y%m%d%H%M", time.gmtime(utc_secs + offset))
+
 def log_to_sheet(row:list):
     """Append one row to the Google Sheet results log."""
     try:
@@ -441,7 +459,7 @@ def log_to_sheet(row:list):
     except Exception as e: alog(f"Sheets: {e}")
 
 def log_url(tab:str, chunk_num:str, prompt:str, model:str, url:str, notes:str=""):
-    ts=time.strftime("%Y-%m-%d %H:%M:%S")
+    ts=sheet_ts()  # yyyymmddhhmm in Croatian local time
     link=f'=HYPERLINK("{url}","Download")'
     log_to_sheet([ts,tab,chunk_num,prompt,model,link,notes])
 
@@ -806,7 +824,7 @@ if not ffok():
 # ─────────────────────────────────────────────────────────────────────────────
 #  TABS
 # ─────────────────────────────────────────────────────────────────────────────
-tab1,tab2,tab3,tab4,tab5 = st.tabs(["PUPPETEER","ANIMATE","IMAGINE","EDIT","SETTINGS"])
+tab1,tab2,tab3,tab4,tab5,tab6 = st.tabs(["PUPPETEER","ANIMATE","IMAGINE","EDIT","HISTORY","SETTINGS"])
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TAB 5 — SETTINGS (render first so values are available to other tabs)
@@ -1399,6 +1417,7 @@ with tab1:
                         prog.progress(pct,text=f"Chunk {i+1}/{len(chunks)}")
                         ch["status"]="run"
                         grid.markdown(chunk_grid_html(chunks,None,act_fps),unsafe_allow_html=True)
+                        _url=None
                         try:
                             stat.info(f"Extracting chunk {i+1}…")
                             seg,eff_s,eff_e=extract_one(ch,act_vb,act_fps)
@@ -1410,22 +1429,29 @@ with tab1:
                                                           img64,vid64,API_MAX_SEC,
                                                           st.session_state.vid_model,_prompt())
                                 stat.info(f"Polling {tid[:12]}…")
-                                url=k_poll_vid(active_ak(),active_sk(),tid)
+                                _url=k_poll_vid(active_ak(),active_sk(),tid)
                             else:
                                 tid=runway_motion(active_rk(),img64,vid64,API_MAX_SEC,
                                                   st.session_state.vid_model,_prompt())
                                 stat.info(f"Polling {tid[:12]}…")
-                                url=runway_poll(active_rk(),tid)
-                            ch["output_url"]=url; ch["status"]="done"
+                                _url=runway_poll(active_rk(),tid)
+                            ch["output_url"]=_url; ch["status"]="done"
                             cost_now+=per; done_n+=1
-                            st.session_state.t1_results.append(url)
+                            st.session_state.t1_results.append(_url)
                             st.session_state.t1_cost=cost_now
-                            log_url("Puppeteer",str(i+1),_prompt(),
-                                    st.session_state.vid_model,url,ch["filename"])
                             alog(f"Chunk {i+1}: done")
                         except Exception as e:
                             ch["status"]="fail"; alog(f"Chunk {i+1}: {e}")
                             st.warning(f"Chunk {i+1}: {e}")
+                        finally:
+                            # Always log to Sheet if we got a URL,
+                            # even if something else crashed afterward
+                            if _url:
+                                try:
+                                    log_url("Puppeteer",str(i+1),_prompt(),
+                                            st.session_state.vid_model,_url,ch["filename"])
+                                except Exception as _le:
+                                    alog(f"Sheet log chunk {i+1}: {_le}")
                         grid.markdown(chunk_grid_html(chunks,None,act_fps),unsafe_allow_html=True)
                         clive.caption(f"{usd(cost_now)} · {done_n} done · "
                                       f"ETA {fmt_dur((n_proc-done_n)*KLING_EST_SEC//3)}")
