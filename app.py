@@ -902,7 +902,7 @@ with tab_hi:
     h_type = st.radio(
         "Task type",
         ["video · image2video","video · text2video","image · generations"],
-        horizontal=False, label_visibility="collapsed")
+        horizontal=False, label_visibility="collapsed", key="h_type")
     type_map = {
         "video · image2video": ("video","image2video"),
         "video · text2video":  ("video","text2video"),
@@ -915,7 +915,7 @@ with tab_hi:
         h_page = st.number_input("Page", 1, 50, 1)
     with hc2:
         h_size = st.radio("Per page",["10","20","30","50"],
-                          horizontal=True, label_visibility="collapsed", index=2)
+                          horizontal=True, label_visibility="collapsed", index=2, key="h_size")
 
     col_pull, col_log = st.columns(2)
     with col_pull:
@@ -1095,7 +1095,7 @@ with tab_se:
     st.session_state.chosen_api=st.radio(
         "API",["Kling AI","RunwayML"],
         horizontal=True,label_visibility="collapsed",
-        index=0 if st.session_state.chosen_api=="Kling AI" else 1)
+        index=0 if st.session_state.chosen_api=="Kling AI" else 1, key="s_api")
 
     st.markdown('<div class="sec">KLING CREDENTIALS</div>',unsafe_allow_html=True)
     if S_AK and S_SK:
@@ -1116,20 +1116,20 @@ with tab_se:
     st.markdown('<div class="sec">VIDEO MODEL</div>',unsafe_allow_html=True)
     _vm=st.radio("Video Model",["Standard","Professional"],horizontal=True,
                  label_visibility="collapsed",
-                 index=1 if st.session_state.vid_model=="pro" else 0)
+                 index=1 if st.session_state.vid_model=="pro" else 0, key="s_vm")
     st.session_state.vid_model="pro" if _vm=="Professional" else "std"
 
     st.markdown('<div class="sec">IMAGE MODEL</div>',unsafe_allow_html=True)
     st.session_state.img_model=st.radio(
         "Image Model",["kolors","kling-v1"],horizontal=True,
         label_visibility="collapsed",
-        index=0 if st.session_state.img_model=="kolors" else 1)
+        index=0 if st.session_state.img_model=="kolors" else 1, key="s_imgm")
 
     st.markdown('<div class="sec">VIDEO PREVIEW SIZE</div>',unsafe_allow_html=True)
     st.session_state.video_size=st.radio(
         "Preview Size",VIDEO_SIZE_OPTS,horizontal=True,
         label_visibility="collapsed",
-        index=VIDEO_SIZE_OPTS.index(st.session_state.video_size))
+        index=VIDEO_SIZE_OPTS.index(st.session_state.video_size), key="s_vs")
     st.caption("Applied to all video and image previews in the app.")
 
     st.markdown('<div class="sec">GLOBAL STYLE PROMPT</div>',unsafe_allow_html=True)
@@ -1193,7 +1193,7 @@ want to keep before the 30-day window closes.
     st.caption("Pull your recent Kling tasks. Note: Kling stores results for ~30 days.")
 
     h_type=st.radio("Task type",["image2video","text2video"],horizontal=True,
-                    label_visibility="collapsed")
+                    label_visibility="collapsed", key="se_htype")
     h_page=st.number_input("Page",1,20,1,label_visibility="visible")
 
     if st.button("Pull from Kling"):
@@ -1438,7 +1438,7 @@ with tab_pu:
         thr_col,det_col=st.columns([3,1])
         with thr_col:
             thr=st.radio("Sensitivity",["0.20","0.35","0.50"],horizontal=True,
-                         label_visibility="collapsed",index=1)
+                         label_visibility="collapsed",index=1,key="pu_thr")
             thr_f=float(thr)
         with det_col:
             if st.button("Auto-detect",key="det"):
@@ -1545,7 +1545,7 @@ with tab_pu:
                     nl=st.checkbox("Loop",settings["loop"],key=f"lp_{ac}")
                 with zm_col:
                     nz=st.radio("Zoom",VIDEO_SIZE_OPTS,horizontal=True,
-                                key=f"zm_{ac}",label_visibility="collapsed",
+                                key=f"zm_{ac}_r",label_visibility="collapsed",
                                 index=VIDEO_SIZE_OPTS.index(
                                     settings.get("zoom",st.session_state.video_size)))
 
@@ -1795,9 +1795,9 @@ with tab_an:
     a_neg=st.text_input("Negative","blur, artifacts, watermark",
                         key="a_neg",label_visibility="collapsed")
     a_dur_r=st.radio("Duration",["5s","10s"],horizontal=True,
-                     label_visibility="collapsed",index=1)
+                     label_visibility="collapsed",index=1,key="an_dur")
     a_dur=5 if a_dur_r=="5s" else 10
-    a_n_r=st.radio("Clips",["1","2","4"],horizontal=True,label_visibility="collapsed")
+    a_n_r=st.radio("Clips",["1","2","4"],horizontal=True,label_visibility="collapsed",key="an_n")
     a_n=int(a_n_r)
     a_per=KLING_VID_PRICE[st.session_state.vid_model].get(a_dur,0.07)
     st.markdown(stats_html([("DURATION",f"{a_dur}s"),("CLIPS",a_n),
@@ -1869,14 +1869,14 @@ with tab_cr:
 
     st.markdown('<div class="sec">SETTINGS</div>',unsafe_allow_html=True)
     cr_dur_r=st.radio("Duration",["5s","10s"],horizontal=True,
-                      label_visibility="collapsed",index=1)
+                      label_visibility="collapsed",index=1,key="cr_dur")
     cr_dur=5 if cr_dur_r=="5s" else 10
 
     cr_aspect=st.radio("Aspect ratio",["16:9","9:16","1:1"],horizontal=True,
-                       label_visibility="collapsed")
+                       label_visibility="collapsed",key="cr_asp")
 
     cr_n_r=st.radio("Clips to generate",["1","2","4"],horizontal=True,
-                    label_visibility="collapsed")
+                    label_visibility="collapsed",key="cr_n")
     cr_n=int(cr_n_r)
 
     cr_per=KLING_VID_PRICE[st.session_state.vid_model][cr_dur]
@@ -2007,9 +2007,9 @@ with tab_im:
 
     st.markdown('<div class="sec">SETTINGS</div>',unsafe_allow_html=True)
     i_aspect=st.radio("Aspect",ASPECT_RATIOS[:5],horizontal=True,
-                      label_visibility="collapsed",index=1)
+                      label_visibility="collapsed",index=1,key="im_asp")
     i_n_r=st.radio("Count",["1","2","4"],horizontal=True,
-                   label_visibility="collapsed")
+                   label_visibility="collapsed",key="im_n")
     i_n=int(i_n_r)
     i_price=KLING_IMG_PRICE[st.session_state.img_model][i_n]
     st.markdown(stats_html([("MODEL",st.session_state.img_model),
@@ -2066,7 +2066,7 @@ with tab_im:
 with tab_ed:
     st.markdown('<div class="sec">MODE</div>',unsafe_allow_html=True)
     edit_mode=st.radio("Mode",list(KLING_EDIT_PRICE.keys()),
-                       horizontal=False,label_visibility="collapsed")
+                       horizontal=False,label_visibility="collapsed",key="ed_mode")
 
     st.markdown('<div class="sec">SOURCE</div>',unsafe_allow_html=True)
     st.caption("Person photo" if edit_mode=="Virtual Try-On" else "Image to edit")
@@ -2111,7 +2111,7 @@ with tab_ed:
                         0.7 if edit_mode=="Inpaint/Repaint" else 0.5,0.05)
         if edit_mode=="Extend Canvas":
             e_dir=st.radio("Direction",["all sides","left","right","top","bottom"],
-                           horizontal=True,label_visibility="collapsed")
+                           horizontal=True,label_visibility="collapsed",key="ed_dir")
             if e_prompt: e_prompt=f"outpaint {e_dir}: {e_prompt}"
 
     edit_cost=KLING_EDIT_PRICE.get(edit_mode,0.012)
