@@ -188,7 +188,7 @@ VIDEO_SIZE_OPTS = ["25%","33%","50%","75%","100%"]
 VIDEO_SIZE_PX   = {"25%":160, "33%":210, "50%":300, "75%":440, "100%":580}
 VIDEO_SIZE_COL  = {"25%":[1,3], "33%":[1,2], "50%":[1,1], "75%":[3,1], "100%":[10,0]}
 
-SHEET_HEADERS = ["YYYYMMDDHHMM (CRO)","Type","#","Prompt","Model","URL (expires ~30d)","⏱ Proc Time","Notes"]
+SHEET_HEADERS = ["YYYYMMDDHHMM (CRO)","Type","#","Prompt","Negative Prompt","Model","URL (expires ~30d)","⏱ Proc Time","Notes"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  SESSION STATE
@@ -208,6 +208,7 @@ _D = dict(
     t1_chunks=[], t1_results=[], t1_zip=None, t1_cost=0.0,
     # tab2
     t2_img_bytes=None, t2_img_fk="", t2_results=[], t2_cost=0.0,
+    t5_results=[], t5_cost=0.0,
     # tab3
     t3_ref_bytes=None, t3_results=[], t3_cost=0.0,
     # tab4
@@ -353,6 +354,21 @@ def kling_animate(ak,sk,img_b64,prompt,neg,dur,model):
     if not tid: raise ValueError(f"No task_id: {d}")
     return tid
 
+def kling_text2video(ak,sk,prompt,neg_prompt,dur,model,aspect="16:9",n=1):
+    """CREATE tab — generate video from text prompt, no image reference."""
+    mode="pro" if model=="pro" else "std"
+    d=k_post(ak,sk,"/v1/videos/text2video",{
+        "model_name":"kling-v1-5",
+        "prompt":prompt,
+        "negative_prompt":neg_prompt or "",
+        "duration":int(dur),
+        "mode":mode,
+        "cfg_scale":0.5,
+        "aspect_ratio":aspect})
+    tid=d.get("data",{}).get("task_id","")
+    if not tid: raise ValueError(f"No task_id: {d}")
+    return tid
+
 def kling_imagine(ak,sk,prompt,neg,aspect,n,model_name,ref_b64=None,fidelity=0.5):
     payload={"model_name":model_name,"prompt":prompt,
              "negative_prompt":neg or "","n":int(n),"aspect_ratio":aspect}
@@ -445,15 +461,22 @@ def _sheet_id():
     except: return ""
 
 def ensure_sheet_header():
+    """
+    Write the header row if it is missing or different from SHEET_HEADERS.
+    Called inside every log_url() so a cleared sheet is always repaired
+    before the next data row is written.
+    """
     try:
         svc=_sheets_svc(); sid=_sheet_id()
         ex=svc.spreadsheets().values().get(
-            spreadsheetId=sid,range="Sheet1!A1").execute()
-        if not ex.get("values"):
+            spreadsheetId=sid,range="Sheet1!A1:Z1").execute()
+        current=(ex.get("values") or [[]])[0]
+        if current != SHEET_HEADERS:      # missing, cleared, or outdated columns
             svc.spreadsheets().values().update(
                 spreadsheetId=sid,range="Sheet1!A1",
                 valueInputOption="RAW",
                 body={"values":[SHEET_HEADERS]}).execute()
+            alog("Sheet header written/restored")
     except Exception as e: alog(f"Sheet header: {e}")
 
 
@@ -484,13 +507,21 @@ def log_to_sheet(row:list):
             body={"values":[row]}).execute()
     except Exception as e: alog(f"Sheets: {e}")
 
-def log_url(tab:str, chunk_num:str, prompt:str, model:str, url:str,
-            notes:str="", process_secs:float=None):
+def log_url(tab:str, chunk_num:str, prompt:str, neg_prompt:str,
+            model:str, url:str, notes:str="", process_secs:float=None):
+    """
+    Log one result to Google Sheet and klinglog.txt.
+    Restores sheet header row automatically if user cleared the sheet.
+    """
     ts   = sheet_ts()
     link = f'=HYPERLINK("{url}","Download")'
     proc = fmt_dur(int(process_secs)) if process_secs is not None else ""
-    log_to_sheet([ts,tab,chunk_num,prompt,model,link,proc,notes])
-    local_log(f"{tab} | #{chunk_num} | {model} | ⏱{proc} | {prompt[:60]} | {url}")
+    # Always check/restore headers before writing — handles cleared sheets
+    try: ensure_sheet_header()
+    except: pass
+    log_to_sheet([ts,tab,chunk_num,prompt,neg_prompt,model,link,proc,notes])
+    local_log(f"{tab} | #{chunk_num} | {model} | ⏱{proc} "
+              f"| +[{prompt[:45]}] -[{neg_prompt[:45]}] | {url}")
 
 def read_sheet_rows():
     try:
@@ -808,7 +839,8 @@ def _bg_poll_worker(session_id,ak,sk):
                     if sheets_configured():
                         try:
                             log_url("Puppeteer",str(task.get("index","")+1),
-                                    task.get("prompt",""),task.get("model",""),url,
+                                    task.get("prompt",""),task.get("neg_prompt",""),
+                                    task.get("model",""),url,
                                     f"chunk {task.get('filename','')}",
                                     process_secs=_bgp)
                             task["sheet_logged"]=True
@@ -856,7 +888,7 @@ if not ffok():
 # ─────────────────────────────────────────────────────────────────────────────
 #  TABS
 # ─────────────────────────────────────────────────────────────────────────────
-tab_an,tab_im,tab_ed,tab_pu,tab_hi,tab_se = st.tabs(["ANIMATE","IMAGINE","EDIT","PUPPETEER","HISTORY","SETTINGS"])
+tab_an,tab_cr,tab_im,tab_ed,tab_pu,tab_hi,tab_se = st.tabs(["ANIMATE","CREATE","IMAGINE","EDIT","PUPPETEER","HISTORY","SETTINGS"])
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TAB 5 — HISTORY
@@ -982,7 +1014,8 @@ with tab_hi:
                                               t.get("prompt","") or "")[:80]
                                 log_url(st.session_state.h_pulled_type,
                                         t.get("task_id","")[:12],
-                                        prompt_txt, "kling-pull", url,
+                                        prompt_txt, "",
+                                        "kling-pull", url,
                                         "from Kling history")
                                 logged += 1
                             except: skipped += 1
@@ -1624,13 +1657,15 @@ with tab_pu:
                                               "url":None,"submitted_at":time.time(),
                                               "completed_at":None,"sheet_logged":False,
                                               "prompt":pu_prompt or _prompt(),
+                                              "neg_prompt":pu_neg,
                                               "model":st.session_state.vid_model})
                             alog(f"Chunk {i+1}: submitted {tid}")
                         except Exception as e:
                             task_list.append({**ch,"task_id":None,"status":"failed",
                                               "error":str(e),"url":None,
                                               "submitted_at":time.time(),"completed_at":None,
-                                              "sheet_logged":False,"prompt":_prompt(),"model":st.session_state.vid_model})
+                                              "sheet_logged":False,"prompt":pu_prompt or _prompt(),
+                                              "neg_prompt":pu_neg,"model":st.session_state.vid_model})
                             alog(f"Chunk {i+1}: submit failed {e}")
                     with _REG_LOCK: _TASK_REG[_sid]=task_list
                     st.session_state.bg_tasks=task_list; st.session_state.bg_active=True
@@ -1699,7 +1734,8 @@ with tab_pu:
                         finally:
                             if _url:
                                 try:
-                                    log_url("Puppeteer",str(i+1),_prompt(),
+                                    log_url("Puppeteer",str(i+1),
+                                            pu_prompt or _prompt(),pu_neg,
                                             st.session_state.vid_model,_url,
                                             ch["filename"],process_secs=_process_secs)
                                 except Exception as _le:
@@ -1793,7 +1829,7 @@ with tab_an:
                             t0=_t0a)
                         _proca=time.time()-_t0a
                         urls.append(url); cost_now+=a_per
-                        log_url("Animate",str(n2+1),a_prompt,
+                        log_url("Animate",str(n2+1),a_prompt,a_neg,
                                 st.session_state.vid_model,url,
                                 process_secs=_proca)
                     st.session_state.t2_results=urls; st.session_state.t2_cost=cost_now
@@ -1815,6 +1851,138 @@ with tab_an:
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TAB 3 — IMAGINE
 # ═══════════════════════════════════════════════════════════════════════════════
+with tab_cr:
+
+    st.markdown('<div class="sec">PROMPT</div>',unsafe_allow_html=True)
+    st.markdown('<div style="color:#fff;font-size:.7rem;font-family:monospace;'
+                'margin-bottom:.2rem;">PROMPT — describe the video you want Kling to generate</div>',
+                unsafe_allow_html=True)
+    cr_prompt=st.text_area("Prompt","",
+        placeholder="a lone dancer on a dark stage, dramatic red spotlight, "
+                    "slow cinematic motion, 4K, sharp detail",
+        key="cr_prompt",label_visibility="collapsed",height=90)
+    st.markdown('<div style="color:#555;font-size:.7rem;font-family:monospace;'
+                'margin:.35rem 0 .15rem;">NEGATIVE PROMPT — what to suppress</div>',
+                unsafe_allow_html=True)
+    cr_neg=st.text_input("Negative","blur, artifacts, watermark, low quality, text",
+                         key="cr_neg",label_visibility="collapsed")
+
+    st.markdown('<div class="sec">SETTINGS</div>',unsafe_allow_html=True)
+    cr_dur_r=st.radio("Duration",["5s","10s"],horizontal=True,
+                      label_visibility="collapsed",index=1)
+    cr_dur=5 if cr_dur_r=="5s" else 10
+
+    cr_aspect=st.radio("Aspect ratio",["16:9","9:16","1:1"],horizontal=True,
+                       label_visibility="collapsed")
+
+    cr_n_r=st.radio("Clips to generate",["1","2","4"],horizontal=True,
+                    label_visibility="collapsed")
+    cr_n=int(cr_n_r)
+
+    cr_per=KLING_VID_PRICE[st.session_state.vid_model][cr_dur]
+    st.markdown(stats_html([
+        ("MODEL", "Kling " + ("Pro" if st.session_state.vid_model=="pro" else "Std")),
+        ("ASPECT", cr_aspect),
+        ("DURATION", f"{cr_dur}s"),
+        ("CLIPS", cr_n),
+        ("EST. COST", usd(cr_per * cr_n)),
+    ]), unsafe_allow_html=True)
+
+    st.markdown('<div class="sec">GENERATE</div>',unsafe_allow_html=True)
+    if not (active_ak() and active_sk()):
+        st.caption("Kling AI credentials required — check Settings.")
+    elif not cr_prompt.strip():
+        st.caption("Enter a prompt above.")
+    else:
+        if st.button(
+            f"Generate · {cr_n} clip(s) · {cr_dur}s · {cr_aspect} · est. {usd(cr_per*cr_n)}",
+            type="primary", disabled=st.session_state.processing, key="go_cr"):
+
+            _ak=active_ak(); _sk=active_sk()
+            st.session_state.t5_results=[]; st.session_state.t5_cost=0.
+            st.session_state.processing=True
+            prog=st.progress(0); stat=st.empty()
+            try:
+                urls=[]; cost_now=0.
+                ensure_sheet_header()
+                for n5 in range(cr_n):
+                    prog.progress(int((n5/cr_n)*90), text=f"Clip {n5+1}/{cr_n}…")
+                    stat.info(f"Submitting clip {n5+1}…")
+                    _t0c=time.time()
+                    tid=kling_text2video(_ak,_sk,cr_prompt,cr_neg,cr_dur,
+                                         st.session_state.vid_model,cr_aspect)
+                    url=k_poll_vid(_ak,_sk,tid,
+                        endpoint="text2video",
+                        status_cb=lambda _t,_e,_s=stat:
+                            _s.info(f"Polling {_t[:12]}… ⏱ {fmt_dur(int(_e))}"),
+                        t0=_t0c)
+                    _procc=time.time()-_t0c
+                    urls.append(url); cost_now+=cr_per
+                    log_url("Create",str(n5+1),cr_prompt,cr_neg,
+                            st.session_state.vid_model,url,process_secs=_procc)
+                st.session_state.t5_results=urls
+                st.session_state.t5_cost=cost_now
+                prog.progress(100)
+                stat.success(f"Done · {len(urls)} clip(s) · {usd(cost_now)}")
+            except Exception as e:
+                stat.error(str(e)); alog(str(e))
+            finally:
+                st.session_state.processing=False
+
+    if st.session_state.t5_results:
+        st.markdown('<div class="sec">RESULTS</div>',unsafe_allow_html=True)
+        st.markdown(stats_html([("CLIPS",len(st.session_state.t5_results)),
+                                ("COST",usd(st.session_state.t5_cost))]),
+                    unsafe_allow_html=True)
+        for j,url in enumerate(st.session_state.t5_results):
+            st.caption(f"Clip {j+1}")
+            show_video(url)
+            r2=requests.get(url,timeout=30)
+            st.download_button(f"Download {j+1}",data=r2.content,
+                               file_name=f"create_{j+1}.mp4",mime="video/mp4",
+                               key=f"dl_cr_{j}")
+
+    with st.expander("About this tab — CREATE"):
+        st.markdown("""
+**What it does**
+
+Generates a video clip entirely from a text prompt — no reference image needed.
+Kling AI's text-to-video model renders motion, lighting, composition and style
+from your description alone.
+
+**When to use it**
+
+- You have a clear scene in mind but no source photo or image to animate.
+- Abstract, cinematic or atmospheric footage where precise character control
+  is less important than mood and composition.
+- Quick concept tests before committing to an ANIMATE or PUPPETEER job.
+
+**Prompt tips**
+
+Be specific about subject, environment, motion and camera:
+*"slow-motion close-up of a candle flame in a dark room, smoke rising, shallow depth of field, cinematic."*
+Add style words at the end: *4K, sharp detail, professional cinematography.*
+
+**Aspect ratios**
+
+- 16:9 — widescreen, landscape video
+- 9:16 — vertical, social/mobile
+- 1:1  — square
+
+**Differences from ANIMATE**
+
+ANIMATE takes a still image and describes how it should move.
+CREATE generates entirely new footage from scratch — no visual reference.
+
+**Cost**
+
+| Mode | 5s | 10s |
+|------|----|-----|
+| Standard 720p | $0.045 | $0.070 |
+| Professional 1080p | $0.090 | $0.140 |
+        """)
+
+
 with tab_im:
     st.markdown('<div class="sec">PROMPT</div>',unsafe_allow_html=True)
     st.markdown('<div style="color:#fff;font-size:.7rem;font-family:monospace;'
@@ -1877,7 +2045,7 @@ with tab_im:
                     stat.success(f"Done · {len(urls)} image(s) · {usd(i_price)} · ⏱ {fmt_dur(int(_proci))}")
                     ensure_sheet_header()
                     for j,u in enumerate(urls):
-                        log_url("Imagine",str(j+1),i_prompt,
+                        log_url("Imagine",str(j+1),i_prompt,i_neg,
                                 st.session_state.img_model,u,process_secs=_proci)
                 except Exception as e: stat.error(str(e))
                 finally: st.session_state.processing=False
@@ -1985,7 +2153,7 @@ with tab_ed:
                     stat.success(f"Done · {len(urls)} result(s) · {usd(edit_cost)} · ⏱ {fmt_dur(int(_proce))}")
                     ensure_sheet_header()
                     for j,u in enumerate(urls):
-                        log_url("Edit",str(j+1),e_prompt,edit_mode,u,process_secs=_proce)
+                        log_url("Edit",str(j+1),e_prompt,e_neg,edit_mode,u,process_secs=_proce)
                 except Exception as e: stat.error(str(e))
                 finally: st.session_state.processing=False
 
