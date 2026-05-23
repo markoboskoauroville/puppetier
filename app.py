@@ -188,7 +188,7 @@ VIDEO_SIZE_OPTS = ["25%","33%","50%","75%","100%"]
 VIDEO_SIZE_PX   = {"25%":160, "33%":210, "50%":300, "75%":440, "100%":580}
 VIDEO_SIZE_COL  = {"25%":[1,3], "33%":[1,2], "50%":[1,1], "75%":[3,1], "100%":[10,0]}
 
-SHEET_HEADERS = ["YYYYMMDDHHMM (CRO)","Type","#","Prompt","Model","URL (expires ~30d)","Notes"]
+SHEET_HEADERS = ["YYYYMMDDHHMM (CRO)","Type","#","Prompt","Model","URL (expires ~30d)","⏱ Proc Time","Notes"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  SESSION STATE
@@ -297,10 +297,14 @@ def k_post(ak,sk,path,payload):
     if not r.ok: raise requests.HTTPError(f"{r.status_code}: {r.text[:300]}",response=r)
     return r.json()
 
-def k_poll_vid(ak,sk,tid,endpoint="image2video",mw=600):
+def k_poll_vid(ak,sk,tid,endpoint="image2video",mw=600,status_cb=None,t0=None):
+    if t0 is None: t0=time.time()
     dl=time.time()+mw
     while True:
         if time.time()>dl: raise TimeoutError(f"Timeout {tid}")
+        if status_cb:
+            try: status_cb(tid, time.time()-t0)
+            except: pass
         r=requests.get(f"{KLING_BASE}/v1/videos/{endpoint}/{tid}",
                        headers=kh(ak,sk),timeout=30)
         r.raise_for_status(); d=r.json().get("data",{})
@@ -311,10 +315,14 @@ def k_poll_vid(ak,sk,tid,endpoint="image2video",mw=600):
         if s in("failed","error"): raise RuntimeError(d.get("task_status_msg","failed"))
         time.sleep(6)
 
-def k_poll_img(ak,sk,tid,endpoint="generations",mw=300):
+def k_poll_img(ak,sk,tid,endpoint="generations",mw=300,status_cb=None,t0=None):
+    if t0 is None: t0=time.time()
     dl=time.time()+mw
     while True:
         if time.time()>dl: raise TimeoutError(f"Timeout {tid}")
+        if status_cb:
+            try: status_cb(tid, time.time()-t0)
+            except: pass
         r=requests.get(f"{KLING_BASE}/v1/images/{endpoint}/{tid}",
                        headers=kh(ak,sk),timeout=30)
         r.raise_for_status(); d=r.json().get("data",{})
@@ -399,10 +407,14 @@ def runway_motion(k,img_b64,vid_b64,dur,model,prompt):
     if not tid: raise ValueError(f"No id: {r.json()}")
     return tid
 
-def runway_poll(k,tid,mw=600):
+def runway_poll(k,tid,mw=600,status_cb=None,t0=None):
+    if t0 is None: t0=time.time()
     dl=time.time()+mw
     while True:
         if time.time()>dl: raise TimeoutError(f"Runway timeout {tid}")
+        if status_cb:
+            try: status_cb(tid, time.time()-t0)
+            except: pass
         r=requests.get(f"{RUNWAY_BASE}/tasks/{tid}",headers=rh(k),timeout=30)
         r.raise_for_status(); d=r.json(); s=d.get("status","PENDING")
         if s=="SUCCEEDED":
@@ -472,12 +484,13 @@ def log_to_sheet(row:list):
             body={"values":[row]}).execute()
     except Exception as e: alog(f"Sheets: {e}")
 
-def log_url(tab:str, chunk_num:str, prompt:str, model:str, url:str, notes:str=""):
-    ts=sheet_ts()  # yyyymmddhhmm in Croatian local time
-    link=f'=HYPERLINK("{url}","Download")'
-    log_to_sheet([ts,tab,chunk_num,prompt,model,link,notes])
-    # Also write to local klinglog.txt
-    local_log(f"{tab} | #{chunk_num} | {model} | {prompt[:60]} | {url}")
+def log_url(tab:str, chunk_num:str, prompt:str, model:str, url:str,
+            notes:str="", process_secs:float=None):
+    ts   = sheet_ts()
+    link = f'=HYPERLINK("{url}","Download")'
+    proc = fmt_dur(int(process_secs)) if process_secs is not None else ""
+    log_to_sheet([ts,tab,chunk_num,prompt,model,link,proc,notes])
+    local_log(f"{tab} | #{chunk_num} | {model} | ⏱{proc} | {prompt[:60]} | {url}")
 
 def read_sheet_rows():
     try:
@@ -789,12 +802,15 @@ def _bg_poll_worker(session_id,ak,sk):
                         task["status"]="failed"; continue
                     task["url"]=url; task["status"]="done"
                     task["completed_at"]=time.time()
-                    # Log to Google Sheet
+                    _bgp=(task["completed_at"]-task["submitted_at"]
+                          if task.get("submitted_at") else None)
+                    # Log to Google Sheet + klinglog.txt with processing time
                     if sheets_configured():
                         try:
                             log_url("Puppeteer",str(task.get("index","")+1),
                                     task.get("prompt",""),task.get("model",""),url,
-                                    f"chunk {task.get('filename','')}")
+                                    f"chunk {task.get('filename','')}",
+                                    process_secs=_bgp)
                             task["sheet_logged"]=True
                         except: pass
                 elif s in("failed","error"):
@@ -1629,39 +1645,44 @@ with tab1:
                         prog.progress(pct,text=f"Chunk {i+1}/{len(chunks)}")
                         ch["status"]="run"
                         grid.markdown(chunk_grid_html(chunks,None,act_fps),unsafe_allow_html=True)
-                        _url=None
+                        _url=None; _process_secs=None
                         try:
                             stat.info(f"Extracting chunk {i+1}…")
                             seg,eff_s,eff_e=extract_one(ch,act_vb,act_fps)
                             alog(f"Chunk {i+1}: {len(seg)//1024}KB")
                             vid64=b64(seg)
                             stat.info(f"Submitting chunk {i+1}…")
+                            _t0=time.time()
                             if st.session_state.chosen_api=="Kling AI":
                                 tid=kling_motion_transfer(active_ak(),active_sk(),
                                                           img64,vid64,API_MAX_SEC,
                                                           st.session_state.vid_model,_prompt())
-                                stat.info(f"Polling {tid[:12]}…")
-                                _url=k_poll_vid(active_ak(),active_sk(),tid)
+                                _url=k_poll_vid(active_ak(),active_sk(),tid,
+                                    status_cb=lambda _t,_e,_s=stat:
+                                        _s.info(f"Polling {_t[:12]}… ⏱ {fmt_dur(int(_e))}"),
+                                    t0=_t0)
                             else:
                                 tid=runway_motion(active_rk(),img64,vid64,API_MAX_SEC,
                                                   st.session_state.vid_model,_prompt())
-                                stat.info(f"Polling {tid[:12]}…")
-                                _url=runway_poll(active_rk(),tid)
+                                _url=runway_poll(active_rk(),tid,
+                                    status_cb=lambda _t,_e,_s=stat:
+                                        _s.info(f"Polling {_t[:12]}… ⏱ {fmt_dur(int(_e))}"),
+                                    t0=_t0)
+                            _process_secs=time.time()-_t0
                             ch["output_url"]=_url; ch["status"]="done"
                             cost_now+=per; done_n+=1
                             st.session_state.t1_results.append(_url)
                             st.session_state.t1_cost=cost_now
-                            alog(f"Chunk {i+1}: done")
+                            alog(f"Chunk {i+1}: done in {fmt_dur(int(_process_secs))}")
                         except Exception as e:
                             ch["status"]="fail"; alog(f"Chunk {i+1}: {e}")
                             st.warning(f"Chunk {i+1}: {e}")
                         finally:
-                            # Always log to Sheet if we got a URL,
-                            # even if something else crashed afterward
                             if _url:
                                 try:
                                     log_url("Puppeteer",str(i+1),_prompt(),
-                                            st.session_state.vid_model,_url,ch["filename"])
+                                            st.session_state.vid_model,_url,
+                                            ch["filename"],process_secs=_process_secs)
                                 except Exception as _le:
                                     alog(f"Sheet log chunk {i+1}: {_le}")
                         grid.markdown(chunk_grid_html(chunks,None,act_fps),unsafe_allow_html=True)
@@ -1738,12 +1759,18 @@ with tab2:
                     for n2 in range(a_n):
                         prog.progress(int((n2/a_n)*90),text=f"Clip {n2+1}/{a_n}…")
                         stat.info(f"Submitting clip {n2+1}…")
+                        _t0a=time.time()
                         tid=kling_animate(_ak,_sk,img64,a_prompt,a_neg,a_dur,
                                           st.session_state.vid_model)
-                        stat.info(f"Polling {tid[:12]}…")
-                        url=k_poll_vid(_ak,_sk,tid)
+                        url=k_poll_vid(_ak,_sk,tid,
+                            status_cb=lambda _t,_e,_s=stat:
+                                _s.info(f"Polling {_t[:12]}… ⏱ {fmt_dur(int(_e))}"),
+                            t0=_t0a)
+                        _proca=time.time()-_t0a
                         urls.append(url); cost_now+=a_per
-                        log_url("Animate",str(n2+1),a_prompt,st.session_state.vid_model,url)
+                        log_url("Animate",str(n2+1),a_prompt,
+                                st.session_state.vid_model,url,
+                                process_secs=_proca)
                     st.session_state.t2_results=urls; st.session_state.t2_cost=cost_now
                     prog.progress(100); stat.success(f"Done · {usd(cost_now)}")
                 except Exception as e: stat.error(str(e))
@@ -1806,15 +1833,21 @@ with tab3:
                     if i_ref: ref_b64=b64(i_ref.read())
                     elif st.session_state.t3_ref_bytes: ref_b64=b64(st.session_state.t3_ref_bytes)
                     stat.info("Submitting…"); prog.progress(20)
+                    _t0i=time.time()
                     tid=kling_imagine(_ak,_sk,i_prompt,i_neg,i_aspect,i_n,
                                       st.session_state.img_model,ref_b64,i_fidelity)
-                    stat.info(f"Polling {tid[:12]}…"); prog.progress(40)
-                    urls=k_poll_img(_ak,_sk,tid)
+                    prog.progress(40)
+                    urls=k_poll_img(_ak,_sk,tid,
+                        status_cb=lambda _t,_e,_s=stat:
+                            _s.info(f"Polling {_t[:12]}… ⏱ {fmt_dur(int(_e))}"))
+                    _proci=time.time()-_t0i
                     st.session_state.t3_results=urls; st.session_state.t3_cost=i_price
-                    prog.progress(100); stat.success(f"Done · {len(urls)} image(s) · {usd(i_price)}")
+                    prog.progress(100)
+                    stat.success(f"Done · {len(urls)} image(s) · {usd(i_price)} · ⏱ {fmt_dur(int(_proci))}")
                     ensure_sheet_header()
                     for j,u in enumerate(urls):
-                        log_url("Imagine",str(j+1),i_prompt,st.session_state.img_model,u)
+                        log_url("Imagine",str(j+1),i_prompt,
+                                st.session_state.img_model,u,process_secs=_proci)
                 except Exception as e: stat.error(str(e))
                 finally: st.session_state.processing=False
 
@@ -1895,20 +1928,27 @@ with tab4:
                 try:
                     img64=b64(st.session_state.t4_img_bytes)
                     stat.info(f"Submitting {edit_mode}…"); prog.progress(20)
+                    _t0e=time.time()
                     if edit_mode=="Virtual Try-On":
                         cloth64=b64(st.session_state.t4_aux_bytes)
                         tid=kling_tryon(_ak,_sk,img64,cloth64)
-                        stat.info(f"Polling {tid[:12]}…"); prog.progress(40)
-                        urls=k_poll_img(_ak,_sk,tid,endpoint="kolors-virtual-try-on")
+                        prog.progress(40)
+                        urls=k_poll_img(_ak,_sk,tid,endpoint="kolors-virtual-try-on",
+                            status_cb=lambda _t,_e,_s=stat:
+                                _s.info(f"Polling {_t[:12]}… ⏱ {fmt_dur(int(_e))}"))
                     else:
                         tid=kling_edit(_ak,_sk,img64,e_prompt,e_neg,e_fid)
-                        stat.info(f"Polling {tid[:12]}…"); prog.progress(40)
-                        urls=k_poll_img(_ak,_sk,tid)
+                        prog.progress(40)
+                        urls=k_poll_img(_ak,_sk,tid,
+                            status_cb=lambda _t,_e,_s=stat:
+                                _s.info(f"Polling {_t[:12]}… ⏱ {fmt_dur(int(_e))}"))
+                    _proce=time.time()-_t0e
                     st.session_state.t4_results=urls; st.session_state.t4_cost=edit_cost
-                    prog.progress(100); stat.success(f"Done · {len(urls)} result(s) · {usd(edit_cost)}")
+                    prog.progress(100)
+                    stat.success(f"Done · {len(urls)} result(s) · {usd(edit_cost)} · ⏱ {fmt_dur(int(_proce))}")
                     ensure_sheet_header()
                     for j,u in enumerate(urls):
-                        log_url("Edit",str(j+1),e_prompt,edit_mode,u)
+                        log_url("Edit",str(j+1),e_prompt,edit_mode,u,process_secs=_proce)
                 except Exception as e: stat.error(str(e))
                 finally: st.session_state.processing=False
 
